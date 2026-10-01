@@ -1,0 +1,41 @@
+.venv/
+__pycache__/
+*.pyc
+*.sqlite3
+*.sqlite3-*
+backend/data/
+node_modules/
+.env
+*.log
+.tools/
+
+# Local configuration and credentials
+.env.*
+!.env.example
+!.env.*.example
+*.pem
+*.key
+
+# Python tooling and build output
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+*.egg-info/
+venv/
+
+# JavaScript build output and coverage
+dist/
+build/
+coverage/
+.cache/
+
+# Operating system and editor files
+.DS_Store
+Thumbs.db
+.idea/
+*.swp
+*.swo

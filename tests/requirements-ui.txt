@@ -1,0 +1,2 @@
+# Optional only: the app itself does not depend on Playwright.
+playwright==1.62.0
