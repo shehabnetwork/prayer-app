@@ -14,7 +14,7 @@
 | `frontend/app.js` | حالة الواجهة، العرض والتفاعل، وطلبات API. |
 | `frontend/domain.js` | حسابات وقواعد المجال في الواجهة. |
 | `frontend/styles.css`، `frontend/assets/` | التنسيق والأصول المرئية. |
-| `backend/main.py` | تطبيق FastAPI؛ `create_app` يبني التطبيق، و`Database` يدير SQLite. مسارات `/api/v1` تشمل المصادقة والحساب والمدن والأيام والفرائض والسنن والتاريخ والإحصاءات. يركّب `frontend/` على `/` عبر `StaticFiles`. نقطة تشغيل Uvicorn هي `backend.main:app`. |
+| `backend/main.py` | تطبيق FastAPI؛ `create_app` يبني التطبيق، و`Database` المستورد من `backend/database.py` يدير التخزين عبر SQLite أو PostgreSQL. مسارات `/api/v1` تشمل المصادقة والحساب والمدن والأيام والفرائض والسنن والتاريخ والإحصاءات. يركّب `frontend/` على `/` عبر `StaticFiles`. نقطة تشغيل Uvicorn هي `backend.main:app`. |
 | `backend/schedule.py` | `CITIES` و`ScheduleService`: مواقيت AlAdhan، التخزين المؤقت، وتحديد الصلوات التي حان وقتها. |
 | `backend/requirements.txt` | اعتمادات Python المثبّتة الإصدارات، ومنها FastAPI وUvicorn وhttpx وPydantic. |
 | `package.json` | مشروع JavaScript بوحدات ES؛ يعرّف أوامر الاختبار وفحص الصياغة. |
@@ -65,3 +65,13 @@
 Daily table compact layout: `frontend/app.js` groups independent controls into five prayer columns plus combined totals; `frontend/styles.css` uses proportional fixed-layout columns and aligned RTL icon slots without horizontal scrolling.
 
 Compact record views: `compactPrayerTable` in `frontend/app.js` is shared by daily student report, achievement history (date rows), and the selected student read-only day. The editable own-day board remains separate. Verification details: `docs/task-notes/compact-record-views.md`.
+
+## PostgreSQL storage — October 4, 2026
+
+- Inspected base: `1a891f586165e2875e199f9093a4c122bbc24ae9`; implementation branch `codex/postgresql-migration`.
+- `backend/database.py`: SQLite-compatible storage interface and Psycopg PostgreSQL adapter, schema migrations and ordered owner-row transaction guards. `backend/main.py` keeps API contracts and imports this class.
+- `backend/migrations/001_initial.sql`: initial PostgreSQL schema, identity IDs, foreign keys and invitation constraints; `schema_migrations` tracks applied versions.
+- `backend/import_sqlite.py`: read-only SQLite snapshot, empty-target atomic transfer, verification, identity reset and dry-run CLI.
+- `backend/tests/test_postgres.py`: isolated-schema API parity and concurrency/configuration tests; `backend/tests/test_postgres_import.py`: source validation and real PostgreSQL transfer/authentication tests. Set `PRAYER_TEST_DATABASE_URL` to run PostgreSQL tests.
+- `compose.postgres.yml`: optional local PostgreSQL16 service with persistent volume and localhost-only port15432. `PRAYER_DATABASE_URL` enables PostgreSQL; no URL retains existing local SQLite behavior.
+- Setup/cutover/rollback commands: `docs/POSTGRESQL-MIGRATION.md`; final verification and review: `docs/task-notes/postgresql-migration.md`.

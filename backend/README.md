@@ -15,7 +15,7 @@ python -m uvicorn backend.main:app --host 127.0.0.1 --port 8000
 ```
 
 Open `http://127.0.0.1:8000/`. The same app serves `frontend/`, so a separate
-frontend server and CORS configuration are unnecessary. API documentation is at
+frontend server and CORS configuration are unnecessary. For PostgreSQL deployment and existing SQLite cutover, see [the migration guide](../docs/POSTGRESQL-MIGRATION.md). API documentation is at
 `/api/docs`; the OpenAPI schema is at `/openapi.json`.
 
 Run the integration tests, using temporary databases and fictitious aliases:
@@ -32,12 +32,14 @@ Configuration:
 
 | Environment variable | Default | Purpose |
 | --- | --- | --- |
-| `PRAYER_DB_PATH` | `backend/data/prayer.sqlite3` | SQLite file path |
+| `PRAYER_DATABASE_URL` | Unset | PostgreSQL URL; takes precedence over the legacy environment path, and failures do not fall back |
+| `PRAYER_DATABASE_SCHEMA` | `public` | PostgreSQL schema; optional isolated test/staging schema |
+| `PRAYER_DB_PATH` | `backend/data/prayer.sqlite3` | SQLite file path when no PostgreSQL URL is configured |
 | `PRAYER_COOKIE_SECURE` | `false` | Set `true` when serving through HTTPS |
 | `PRAYER_TRUSTED_ORIGIN` | Request origin | Exact external origin, e.g. `https://example.com`, for reverse-proxy deployments |
 
 `create_app(db_path, cookie_secure=..., trusted_origin=..., auth_limit=...)` is
-available for integration tests or embedding. Pass a file path, not `:memory:`.
+available for integration tests or embedding. Pass a SQLite file path or PostgreSQL URL, not `:memory:`. Explicit database arguments override environment selection. PostgreSQL storage and versioned migrations live in `backend/database.py` and `backend/migrations/`; `python -m backend.database migrate` initializes the configured PostgreSQL target without starting the app.
 Deploy behind HTTPS, use secure cookies, restrict documentation if necessary,
 protect the database/backups, and configure a trusted external origin before
 production use. This small in-memory authentication limiter is per process; a
@@ -175,7 +177,7 @@ For example, setting only block 1 gives `[false,true]`, preserved across reloads
 and database restarts. The full PUT must include both blocks and their matching
 derived sunnah count; inconsistent snapshots are rejected.
 
-Updates are serialized in SQLite transactions, so independent atomic changes
+Updates are serialized in database transactions (SQLite writer lock or PostgreSQL owner-row lock), so independent atomic changes
 and fast prayer cycles do not lose updates. Supplying a stale version returns
 `409` without making any change. A client using full PUT must re-read and resolve
 the conflict; it must not silently retry with a new version.

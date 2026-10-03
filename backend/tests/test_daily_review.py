@@ -53,7 +53,7 @@ class DailyReviewTests(unittest.IsolatedAsyncioTestCase):
     def add_user(self, user_id, alias, city=None, supervisor=False, linked=True):
         with self.app.state.database.connect() as conn:
             conn.execute('INSERT INTO users(id,alias,alias_key,password_hash,created_at,city_id,can_supervise) VALUES(?,?,?,?,?,?,?)',
-                         (user_id, alias, alias.casefold(), 'unused', 0, city, supervisor))
+                         (user_id, alias, alias.casefold(), 'unused', 0, city, int(supervisor)))
             if linked and user_id != 1:
                 conn.execute('INSERT INTO supervisor_children VALUES(?,?,?)', (1, user_id, 0))
 

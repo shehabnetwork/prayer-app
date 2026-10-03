@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import base64
 from collections import defaultdict, deque
-from contextlib import contextmanager
 from datetime import date as Date, datetime, timedelta, timezone
 import hashlib
 import hmac
@@ -13,7 +12,6 @@ import os
 from pathlib import Path
 import re
 import secrets
-import sqlite3
 import threading
 import time
 import unicodedata
@@ -27,6 +25,7 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, field_validator, model_validator
 
+from .database import Database, is_unique_violation
 from .schedule import CITIES, CITIES_BY_ID, ScheduleService
 
 
@@ -273,7 +272,7 @@ def snapshot(day: dict, schedule: dict | None = None, *, scheduled: bool = False
     return result
 
 
-def row_day(row: sqlite3.Row) -> dict:
+def row_day(row) -> dict:
     return {
         "date": row["date"],
         "prayers": json.loads(row["prayers"]),
@@ -283,129 +282,6 @@ def row_day(row: sqlite3.Row) -> dict:
     }
 
 
-class Database:
-    def __init__(self, path: str | Path):
-        self.path = str(Path(path).expanduser().resolve())
-        Path(self.path).parent.mkdir(parents=True, exist_ok=True)
-        with self.connect() as conn:
-            conn.execute("PRAGMA journal_mode=WAL")
-            conn.executescript("""
-                CREATE TABLE IF NOT EXISTS users (
-                    id INTEGER PRIMARY KEY,
-                    alias TEXT NOT NULL,
-                    alias_key TEXT NOT NULL UNIQUE,
-                    password_hash TEXT NOT NULL,
-                    created_at REAL NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS sessions (
-                    token_hash TEXT PRIMARY KEY,
-                    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                    expires_at REAL NOT NULL
-                );
-                CREATE INDEX IF NOT EXISTS session_user ON sessions(user_id);
-                CREATE TABLE IF NOT EXISTS days (
-                    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                    date TEXT NOT NULL,
-                    prayers TEXT NOT NULL,
-                    sunnah TEXT NOT NULL,
-                    dhuhr_before_blocks TEXT NOT NULL,
-                    version INTEGER NOT NULL,
-                    updated_at REAL NOT NULL,
-                    PRIMARY KEY(user_id, date)
-                );
-            """)
-            columns = {row["name"] for row in conn.execute("PRAGMA table_info(users)")}
-            if "city_id" not in columns:
-                try:
-                    conn.execute("ALTER TABLE users ADD COLUMN city_id TEXT")
-                except sqlite3.OperationalError as exc:
-                    if "duplicate column" not in str(exc).lower():
-                        raise
-            if "can_supervise" not in columns:
-                try:
-                    conn.execute("ALTER TABLE users ADD COLUMN can_supervise INTEGER NOT NULL DEFAULT 0 CHECK(can_supervise IN (0,1))")
-                except sqlite3.OperationalError as exc:
-                    if "duplicate column" not in str(exc).lower():
-                        raise
-            conn.executescript("""
-                CREATE TABLE IF NOT EXISTS supervisor_children (
-                    supervisor_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                    child_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                    created_at REAL NOT NULL,
-                    PRIMARY KEY(supervisor_id, child_id),
-                    CHECK(supervisor_id != child_id)
-                );
-                CREATE INDEX IF NOT EXISTS supervisor_child ON supervisor_children(child_id);
-                CREATE TABLE IF NOT EXISTS supervisor_invites (
-                    id INTEGER PRIMARY KEY,
-                    supervisor_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                    token_hash TEXT NOT NULL UNIQUE,
-                    created_at REAL NOT NULL,
-                    revoked_at REAL
-                );
-                CREATE UNIQUE INDEX IF NOT EXISTS supervisor_active_invite
-                    ON supervisor_invites(supervisor_id) WHERE revoked_at IS NULL;
-                CREATE TABLE IF NOT EXISTS supervisor_invite_acceptances (
-                    invite_id INTEGER NOT NULL REFERENCES supervisor_invites(id) ON DELETE CASCADE,
-                    child_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                    request_key TEXT NOT NULL,
-                    accepted_at REAL NOT NULL,
-                    PRIMARY KEY(child_id, request_key)
-                );
-            """)
-        # The file contains hashes and private progress: do not make it world-readable.
-        try:
-            os.chmod(self.path, 0o600)
-        except OSError:
-            pass
-
-    @contextmanager
-    def connect(self):
-        conn = sqlite3.connect(self.path, timeout=10)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA foreign_keys=ON")
-        try:
-            yield conn
-            conn.commit()
-        except Exception:
-            conn.rollback()
-            raise
-        finally:
-            conn.close()
-
-    def get_day(self, user_id: int, day: str) -> dict:
-        with self.connect() as conn:
-            row = conn.execute("SELECT * FROM days WHERE user_id=? AND date=?", (user_id, day)).fetchone()
-            return row_day(row) if row else blank_day(day)
-
-    def update_day(self, user_id: int, day: str, version: int | None, mutate) -> dict:
-        with self.connect() as conn:
-            # Serialize read-modify-write so rapid cycles and independent blocks do not overwrite each other.
-            conn.execute("BEGIN IMMEDIATE")
-            row = conn.execute("SELECT * FROM days WHERE user_id=? AND date=?", (user_id, day)).fetchone()
-            record = row_day(row) if row else blank_day(day)
-            if version is not None and version != record["version"]:
-                raise HTTPException(409, "تم تحديث هذا اليوم في مكان آخر. حدّث الصفحة ثم حاول مجددًا")
-            mutate(record)
-            record["version"] += 1
-            conn.execute("""
-                INSERT INTO days(user_id,date,prayers,sunnah,dhuhr_before_blocks,version,updated_at)
-                VALUES(?,?,?,?,?,?,?)
-                ON CONFLICT(user_id,date) DO UPDATE SET
-                    prayers=excluded.prayers,sunnah=excluded.sunnah,
-                    dhuhr_before_blocks=excluded.dhuhr_before_blocks,
-                    version=excluded.version,updated_at=excluded.updated_at
-            """, (user_id, day, json.dumps(record["prayers"]), json.dumps(record["sunnah"]),
-                  json.dumps(record["dhuhr_before_blocks"]), record["version"], time.time()))
-            return snapshot(record)
-
-    def get_days(self, user_id: int, start: str | None = None, end: str | None = None) -> list[dict]:
-        sql, params = "SELECT * FROM days WHERE user_id=?", [user_id]
-        if start is not None:
-            sql += " AND date BETWEEN ? AND ?"
-            params += [start, end]
-        with self.connect() as conn:
-            return [snapshot(row_day(row)) for row in conn.execute(sql + " ORDER BY date", params).fetchall()]
 
 
 class AuthLimiter:
@@ -482,7 +358,10 @@ def aggregate(days: list[dict]) -> dict:
 def create_app(db_path: str | Path | None = None, *, cookie_secure: bool | None = None,
                trusted_origin: str | None = None, auth_limit: int = 20,
                schedule_service: ScheduleService | None = None) -> FastAPI:
-    db_path = db_path or os.environ.get("PRAYER_DB_PATH") or Path(__file__).parent / "data" / "prayer.sqlite3"
+    configured_url = os.environ.get("PRAYER_DATABASE_URL")
+    if db_path is None and configured_url is not None and not configured_url.startswith(("postgres://", "postgresql://")):
+        raise ValueError("PRAYER_DATABASE_URL must be a PostgreSQL URL")
+    db_path = db_path if db_path is not None else (configured_url or os.environ.get("PRAYER_DB_PATH") or Path(__file__).parent / "data" / "prayer.sqlite3")
     cookie_secure = cookie_secure if cookie_secure is not None else os.environ.get("PRAYER_COOKIE_SECURE", "false").lower() == "true"
     trusted_origin = trusted_origin or os.environ.get("PRAYER_TRUSTED_ORIGIN")
     if trusted_origin and normalized_origin(trusted_origin) is None:
@@ -662,11 +541,13 @@ def create_app(db_path: str | Path | None = None, *, cookie_secure: bool | None 
         try:
             with database.connect() as conn:
                 can_supervise = body.account_type == "supervisor"
-                cursor = conn.execute("INSERT INTO users(alias,alias_key,password_hash,created_at,can_supervise) VALUES(?,?,?,?,?)",
-                                      (body.alias, body.alias.casefold(), stored_hash, time.time(), can_supervise))
-                return issue_session(conn, user_view({"id": cursor.lastrowid, "alias": body.alias, "city_id": None,
+                user_id = conn.insert_id("INSERT INTO users(alias,alias_key,password_hash,created_at,can_supervise) VALUES(?,?,?,?,?)",
+                                      (body.alias, body.alias.casefold(), stored_hash, time.time(), int(can_supervise)))
+                return issue_session(conn, user_view({"id": user_id, "alias": body.alias, "city_id": None,
                                                       "can_supervise": can_supervise}), response)
-        except sqlite3.IntegrityError:
+        except Exception as exc:
+            if not is_unique_violation(exc):
+                raise
             raise HTTPException(409, "هذا الاسم المستعار مستخدم. اختر اسمًا آخر") from None
 
     @app.post("/api/v1/auth/login")
@@ -694,6 +575,8 @@ def create_app(db_path: str | Path | None = None, *, cookie_secure: bool | None 
     def patch_account(body: AccountPatch, user: dict = Depends(current_user)):
         with database.connect() as conn:
             updates = body.model_dump(exclude_unset=True)
+            if "can_supervise" in updates:
+                updates["can_supervise"] = int(updates["can_supervise"])
             assignments = ",".join(f"{key}=?" for key in updates)
             conn.execute(f"UPDATE users SET {assignments} WHERE id=?", (*updates.values(), user["id"]))
             row = conn.execute("SELECT * FROM users WHERE id=?", (user["id"],)).fetchone()
@@ -724,16 +607,16 @@ def create_app(db_path: str | Path | None = None, *, cookie_secure: bool | None 
         token = secrets.token_urlsafe(32)
         now = time.time()
         with database.connect() as conn:
-            conn.execute("BEGIN IMMEDIATE")
+            conn.lock_users([user["id"]])
             if rotate:
                 conn.execute("UPDATE supervisor_invites SET revoked_at=? WHERE supervisor_id=? AND revoked_at IS NULL",
                              (now, user["id"]))
             elif conn.execute("SELECT 1 FROM supervisor_invites WHERE supervisor_id=? AND revoked_at IS NULL",
                               (user["id"],)).fetchone():
                 raise HTTPException(409, "لديك رابط نشط بالفعل. استبدله إذا فقدت نسخته")
-            cursor = conn.execute("INSERT INTO supervisor_invites(supervisor_id,token_hash,created_at) VALUES(?,?,?)",
+            invite_id = conn.insert_id("INSERT INTO supervisor_invites(supervisor_id,token_hash,created_at) VALUES(?,?,?)",
                                   (user["id"], token_hash(token), now))
-            invite = {"id": cursor.lastrowid, "created_at": now, "revoked_at": None}
+            invite = {"id": invite_id, "created_at": now, "revoked_at": None}
         # Never derive a share link from an untrusted Host or forwarded header.
         link = f"{trusted_origin.rstrip('/')}/#invite={token}" if trusted_origin else None
         return {"invite": invite, "token": token, "link": link}
@@ -760,6 +643,7 @@ def create_app(db_path: str | Path | None = None, *, cookie_secure: bool | None 
     def revoke_invite(invite_id: int, user: dict = Depends(current_user)):
         require_supervisor(user)
         with database.connect() as conn:
+            conn.lock_users([user["id"]])
             cursor = conn.execute("UPDATE supervisor_invites SET revoked_at=COALESCE(revoked_at,?) WHERE id=? AND supervisor_id=?",
                                   (time.time(), invite_id, user["id"]))
             if not cursor.rowcount:
@@ -777,7 +661,10 @@ def create_app(db_path: str | Path | None = None, *, cookie_secure: bool | None 
     def accept_invite(body: InviteAcceptance, request: Request, user: dict = Depends(current_user)):
         invite_lookup_limiter.check(request)
         with database.connect() as conn:
-            conn.execute("BEGIN IMMEDIATE")
+            # Invite ownership is immutable; recheck validity only after locking both users.
+            owner = conn.execute("SELECT supervisor_id FROM supervisor_invites WHERE token_hash=?",
+                                 (token_hash(body.token),)).fetchone()
+            conn.lock_users([user["id"]] + ([owner["supervisor_id"]] if owner else []))
             previous = conn.execute("""
                 SELECT supervisor_invites.*,users.alias FROM supervisor_invite_acceptances
                 JOIN supervisor_invites ON supervisor_invites.id=supervisor_invite_acceptances.invite_id
@@ -793,7 +680,7 @@ def create_app(db_path: str | Path | None = None, *, cookie_secure: bool | None 
             if row["supervisor_id"] == user["id"]:
                 raise HTTPException(409, "لا يمكنك إضافة نفسك مشرفًا على حسابك")
             now = time.time()
-            conn.execute("INSERT OR IGNORE INTO supervisor_children(supervisor_id,child_id,created_at) VALUES(?,?,?)",
+            conn.execute("INSERT INTO supervisor_children(supervisor_id,child_id,created_at) VALUES(?,?,?) ON CONFLICT(supervisor_id,child_id) DO NOTHING",
                          (row["supervisor_id"], user["id"], now))
             conn.execute("INSERT INTO supervisor_invite_acceptances(invite_id,child_id,request_key,accepted_at) VALUES(?,?,?,?)",
                          (row["id"], user["id"], body.request_key, now))
@@ -811,6 +698,7 @@ def create_app(db_path: str | Path | None = None, *, cookie_secure: bool | None 
     @app.delete("/api/v1/account/supervisors/{supervisor_id}")
     def remove_supervisor(supervisor_id: int, user: dict = Depends(current_user)):
         with database.connect() as conn:
+            conn.lock_users([supervisor_id, user["id"]])
             conn.execute("DELETE FROM supervisor_children WHERE supervisor_id=? AND child_id=?", (supervisor_id, user["id"]))
         return {"ok": True}
 
@@ -892,6 +780,7 @@ def create_app(db_path: str | Path | None = None, *, cookie_secure: bool | None 
     def remove_child(child_id: int, user: dict = Depends(current_user)):
         require_supervisor(user)
         with database.connect() as conn:
+            conn.lock_users([user["id"], child_id])
             conn.execute("DELETE FROM supervisor_children WHERE supervisor_id=? AND child_id=?", (user["id"], child_id))
         return {"ok": True}
 

@@ -1,0 +1,20 @@
+# Optional local PostgreSQL service. Set PRAYER_POSTGRES_PASSWORD first.
+services:
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: prayer
+      POSTGRES_USER: prayer
+      POSTGRES_PASSWORD: ${PRAYER_POSTGRES_PASSWORD:?Set PRAYER_POSTGRES_PASSWORD}
+    ports:
+      - "127.0.0.1:15432:5432"
+    volumes:
+      - prayer_postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U prayer -d prayer"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+volumes:
+  prayer_postgres:
