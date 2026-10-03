@@ -5,7 +5,7 @@ from __future__ import annotations
 import base64
 from collections import defaultdict, deque
 from contextlib import contextmanager
-from datetime import date as Date, timedelta
+from datetime import date as Date, datetime, timedelta, timezone
 import hashlib
 import hmac
 import json
@@ -19,6 +19,7 @@ import time
 import unicodedata
 from typing import Annotated, Literal
 from urllib.parse import urlsplit
+from zoneinfo import ZoneInfo
 
 from fastapi import Body, Depends, FastAPI, HTTPException, Query, Request, Response
 from fastapi.exceptions import RequestValidationError
@@ -70,6 +71,18 @@ class Credentials(StrictModel):
         return value
 
 
+class Registration(Credentials):
+    account_type: Literal["child", "supervisor"] = "child"
+
+
+class InviteToken(StrictModel):
+    token: Annotated[str, Field(min_length=32, max_length=128, pattern=r"^[A-Za-z0-9_-]+$")]
+
+
+class InviteAcceptance(InviteToken):
+    request_key: Annotated[str, Field(min_length=16, max_length=128, pattern=r"^[A-Za-z0-9_-]+$")]
+
+
 class Prayers(StrictModel):
     fajr: PrayerState
     dhuhr: PrayerState
@@ -118,14 +131,21 @@ class CyclePatch(StrictModel):
 
 
 class AccountPatch(StrictModel):
-    city_id: str
+    city_id: str | None = None
+    can_supervise: StrictBool | None = None
 
     @field_validator("city_id")
     @classmethod
-    def validate_city(cls, value: str) -> str:
+    def validate_city(cls, value: str | None) -> str:
         if value not in CITIES_BY_ID:
             raise ValueError("اختر مدينة من القائمة")
         return value
+
+    @model_validator(mode="after")
+    def validate_update(self):
+        if not self.model_fields_set or ("can_supervise" in self.model_fields_set and self.can_supervise is not True):
+            raise ValueError("يمكن تفعيل الإشراف فقط")
+        return self
 
 
 class SunnahPatch(StrictModel):
@@ -301,6 +321,38 @@ class Database:
                 except sqlite3.OperationalError as exc:
                     if "duplicate column" not in str(exc).lower():
                         raise
+            if "can_supervise" not in columns:
+                try:
+                    conn.execute("ALTER TABLE users ADD COLUMN can_supervise INTEGER NOT NULL DEFAULT 0 CHECK(can_supervise IN (0,1))")
+                except sqlite3.OperationalError as exc:
+                    if "duplicate column" not in str(exc).lower():
+                        raise
+            conn.executescript("""
+                CREATE TABLE IF NOT EXISTS supervisor_children (
+                    supervisor_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    child_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    created_at REAL NOT NULL,
+                    PRIMARY KEY(supervisor_id, child_id),
+                    CHECK(supervisor_id != child_id)
+                );
+                CREATE INDEX IF NOT EXISTS supervisor_child ON supervisor_children(child_id);
+                CREATE TABLE IF NOT EXISTS supervisor_invites (
+                    id INTEGER PRIMARY KEY,
+                    supervisor_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    token_hash TEXT NOT NULL UNIQUE,
+                    created_at REAL NOT NULL,
+                    revoked_at REAL
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS supervisor_active_invite
+                    ON supervisor_invites(supervisor_id) WHERE revoked_at IS NULL;
+                CREATE TABLE IF NOT EXISTS supervisor_invite_acceptances (
+                    invite_id INTEGER NOT NULL REFERENCES supervisor_invites(id) ON DELETE CASCADE,
+                    child_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    request_key TEXT NOT NULL,
+                    accepted_at REAL NOT NULL,
+                    PRIMARY KEY(child_id, request_key)
+                );
+            """)
         # The file contains hashes and private progress: do not make it world-readable.
         try:
             os.chmod(self.path, 0o600)
@@ -437,6 +489,8 @@ def create_app(db_path: str | Path | None = None, *, cookie_secure: bool | None 
         raise ValueError("PRAYER_TRUSTED_ORIGIN must be an http(s) origin, without a path")
     database = Database(db_path)
     limiter = AuthLimiter(auth_limit)
+    invite_write_limiter = AuthLimiter(limit=60, window=600)
+    invite_lookup_limiter = AuthLimiter(limit=600, window=600)
     schedules = schedule_service or ScheduleService()
     # A dummy hash makes nonexistent aliases take the same password-verification path.
     dummy_password = password_hash(secrets.token_urlsafe(32))
@@ -503,7 +557,7 @@ def create_app(db_path: str | Path | None = None, *, cookie_secure: bool | None 
             raise HTTPException(401, "سجّل الدخول أولًا", headers={"WWW-Authenticate": "Bearer"})
         with database.connect() as conn:
             row = conn.execute("""
-                SELECT users.id,users.alias,users.city_id FROM sessions JOIN users ON users.id=sessions.user_id
+                SELECT users.id,users.alias,users.city_id,users.can_supervise FROM sessions JOIN users ON users.id=sessions.user_id
                 WHERE sessions.token_hash=? AND sessions.expires_at>?
             """, (token_hash(token), time.time())).fetchone()
         if row is None:
@@ -515,6 +569,7 @@ def create_app(db_path: str | Path | None = None, *, cookie_secure: bool | None 
         city = CITIES_BY_ID.get(city_id)
         return {
             "id": user["id"], "alias": user["alias"], "city_id": city_id,
+            "can_supervise": bool(user["can_supervise"]),
             "city_name": city["name"] if city else None,
             "timezone": city["timezone"] if city else None,
             "today": schedules.today(city) if city else None,
@@ -601,14 +656,16 @@ def create_app(db_path: str | Path | None = None, *, cookie_secure: bool | None 
         return {"ok": True}
 
     @app.post("/api/v1/auth/register", status_code=201)
-    def register(body: Credentials, response: Response, request: Request):
+    def register(body: Registration, response: Response, request: Request):
         limiter.check(request)
         stored_hash = password_hash(body.password)
         try:
             with database.connect() as conn:
-                cursor = conn.execute("INSERT INTO users(alias,alias_key,password_hash,created_at) VALUES(?,?,?,?)",
-                                      (body.alias, body.alias.casefold(), stored_hash, time.time()))
-                return issue_session(conn, user_view({"id": cursor.lastrowid, "alias": body.alias, "city_id": None}), response)
+                can_supervise = body.account_type == "supervisor"
+                cursor = conn.execute("INSERT INTO users(alias,alias_key,password_hash,created_at,can_supervise) VALUES(?,?,?,?,?)",
+                                      (body.alias, body.alias.casefold(), stored_hash, time.time(), can_supervise))
+                return issue_session(conn, user_view({"id": cursor.lastrowid, "alias": body.alias, "city_id": None,
+                                                      "can_supervise": can_supervise}), response)
         except sqlite3.IntegrityError:
             raise HTTPException(409, "هذا الاسم المستعار مستخدم. اختر اسمًا آخر") from None
 
@@ -636,8 +693,241 @@ def create_app(db_path: str | Path | None = None, *, cookie_secure: bool | None 
     @app.patch("/api/v1/account")
     def patch_account(body: AccountPatch, user: dict = Depends(current_user)):
         with database.connect() as conn:
-            conn.execute("UPDATE users SET city_id=? WHERE id=?", (body.city_id, user["id"]))
-        return {"user": user_view({**user, "city_id": body.city_id})}
+            updates = body.model_dump(exclude_unset=True)
+            assignments = ",".join(f"{key}=?" for key in updates)
+            conn.execute(f"UPDATE users SET {assignments} WHERE id=?", (*updates.values(), user["id"]))
+            row = conn.execute("SELECT * FROM users WHERE id=?", (user["id"],)).fetchone()
+        return {"user": user_view(row)}
+
+    def require_supervisor(user: dict):
+        if not user["can_supervise"]:
+            raise HTTPException(403, "فعّل الإشراف من حسابي أولًا")
+
+    def invite_view(row) -> dict:
+        return {key: row[key] for key in ("id", "created_at", "revoked_at")}
+
+    def active_invite(conn, token: str):
+        row = conn.execute("""
+            SELECT supervisor_invites.*,users.alias FROM supervisor_invites
+            JOIN users ON users.id=supervisor_invites.supervisor_id
+            WHERE supervisor_invites.token_hash=? AND revoked_at IS NULL AND users.can_supervise=1
+        """, (token_hash(token),)).fetchone()
+        if row is None:
+            raise HTTPException(404, "رابط الإشراف غير صالح أو تم إلغاؤه أو استبداله")
+        return row
+
+    def supervisor_view(row) -> dict:
+        return {"id": row["supervisor_id"], "alias": row["alias"]}
+
+    def create_invite(user: dict, rotate: bool) -> dict:
+        require_supervisor(user)
+        token = secrets.token_urlsafe(32)
+        now = time.time()
+        with database.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            if rotate:
+                conn.execute("UPDATE supervisor_invites SET revoked_at=? WHERE supervisor_id=? AND revoked_at IS NULL",
+                             (now, user["id"]))
+            elif conn.execute("SELECT 1 FROM supervisor_invites WHERE supervisor_id=? AND revoked_at IS NULL",
+                              (user["id"],)).fetchone():
+                raise HTTPException(409, "لديك رابط نشط بالفعل. استبدله إذا فقدت نسخته")
+            cursor = conn.execute("INSERT INTO supervisor_invites(supervisor_id,token_hash,created_at) VALUES(?,?,?)",
+                                  (user["id"], token_hash(token), now))
+            invite = {"id": cursor.lastrowid, "created_at": now, "revoked_at": None}
+        # Never derive a share link from an untrusted Host or forwarded header.
+        link = f"{trusted_origin.rstrip('/')}/#invite={token}" if trusted_origin else None
+        return {"invite": invite, "token": token, "link": link}
+
+    @app.post("/api/v1/supervisor/invites", status_code=201)
+    def post_invite(request: Request, user: dict = Depends(current_user)):
+        invite_write_limiter.check(request)
+        return create_invite(user, rotate=False)
+
+    @app.post("/api/v1/supervisor/invites/rotate", status_code=201)
+    def rotate_invite(request: Request, user: dict = Depends(current_user)):
+        invite_write_limiter.check(request)
+        return create_invite(user, rotate=True)
+
+    @app.get("/api/v1/supervisor/invites")
+    def list_invites(user: dict = Depends(current_user)):
+        require_supervisor(user)
+        with database.connect() as conn:
+            rows = conn.execute("SELECT id,created_at,revoked_at FROM supervisor_invites WHERE supervisor_id=? ORDER BY id DESC",
+                                (user["id"],)).fetchall()
+        return {"invites": [invite_view(row) for row in rows]}
+
+    @app.delete("/api/v1/supervisor/invites/{invite_id}")
+    def revoke_invite(invite_id: int, user: dict = Depends(current_user)):
+        require_supervisor(user)
+        with database.connect() as conn:
+            cursor = conn.execute("UPDATE supervisor_invites SET revoked_at=COALESCE(revoked_at,?) WHERE id=? AND supervisor_id=?",
+                                  (time.time(), invite_id, user["id"]))
+            if not cursor.rowcount:
+                raise HTTPException(404, "رابط الإشراف غير موجود")
+        return {"ok": True}
+
+    @app.post("/api/v1/supervisor-invites/preview")
+    def preview_invite(body: InviteToken, request: Request):
+        invite_lookup_limiter.check(request)
+        with database.connect() as conn:
+            row = active_invite(conn, body.token)
+        return {"supervisor": supervisor_view(row), "scope": "prayer_history_read"}
+
+    @app.post("/api/v1/supervisor-invites/accept")
+    def accept_invite(body: InviteAcceptance, request: Request, user: dict = Depends(current_user)):
+        invite_lookup_limiter.check(request)
+        with database.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            previous = conn.execute("""
+                SELECT supervisor_invites.*,users.alias FROM supervisor_invite_acceptances
+                JOIN supervisor_invites ON supervisor_invites.id=supervisor_invite_acceptances.invite_id
+                JOIN users ON users.id=supervisor_invites.supervisor_id
+                WHERE child_id=? AND request_key=?
+            """, (user["id"], body.request_key)).fetchone()
+            if previous is not None:
+                if not hmac.compare_digest(previous["token_hash"], token_hash(body.token)):
+                    raise HTTPException(409, "استُخدم مفتاح هذا الطلب لرابط آخر. أكد الإضافة من جديد")
+                # A retry is a receipt, never a new grant, including after unlink/revocation.
+                return {"ok": True, "supervisor": supervisor_view(previous)}
+            row = active_invite(conn, body.token)
+            if row["supervisor_id"] == user["id"]:
+                raise HTTPException(409, "لا يمكنك إضافة نفسك مشرفًا على حسابك")
+            now = time.time()
+            conn.execute("INSERT OR IGNORE INTO supervisor_children(supervisor_id,child_id,created_at) VALUES(?,?,?)",
+                         (row["supervisor_id"], user["id"], now))
+            conn.execute("INSERT INTO supervisor_invite_acceptances(invite_id,child_id,request_key,accepted_at) VALUES(?,?,?,?)",
+                         (row["id"], user["id"], body.request_key, now))
+        return {"ok": True, "supervisor": supervisor_view(row)}
+
+    @app.get("/api/v1/account/supervisors")
+    def list_supervisors(user: dict = Depends(current_user)):
+        with database.connect() as conn:
+            rows = conn.execute("""
+                SELECT users.id,users.alias FROM supervisor_children
+                JOIN users ON users.id=supervisor_children.supervisor_id WHERE child_id=? ORDER BY users.id
+            """, (user["id"],)).fetchall()
+        return {"supervisors": [dict(row) for row in rows]}
+
+    @app.delete("/api/v1/account/supervisors/{supervisor_id}")
+    def remove_supervisor(supervisor_id: int, user: dict = Depends(current_user)):
+        with database.connect() as conn:
+            conn.execute("DELETE FROM supervisor_children WHERE supervisor_id=? AND child_id=?", (supervisor_id, user["id"]))
+        return {"ok": True}
+
+    @app.get("/api/v1/supervisor/children")
+    def list_children(user: dict = Depends(current_user)):
+        require_supervisor(user)
+        with database.connect() as conn:
+            rows = conn.execute("""
+                SELECT users.* FROM supervisor_children JOIN users ON users.id=supervisor_children.child_id
+                WHERE supervisor_id=? ORDER BY users.id
+            """, (user["id"],)).fetchall()
+        return {"children": [user_view(row) for row in rows]}
+
+    @app.get("/api/v1/supervisor/daily-review")
+    def daily_review(date: str, limit: int = Query(default=50, ge=1, le=100),
+                     offset: int = Query(default=0, ge=0), user: dict = Depends(current_user)):
+        require_supervisor(user)
+        date = validated_date(date)
+        instant = datetime.now(timezone.utc)
+        with database.connect() as conn:
+            roster = conn.execute("""
+                SELECT users.id, users.alias, users.alias_key, users.city_id,
+                       days.date, days.prayers, days.sunnah, days.dhuhr_before_blocks, days.version
+                FROM supervisor_children JOIN users ON users.id=supervisor_children.child_id
+                LEFT JOIN days ON days.user_id=users.id AND days.date=?
+                WHERE supervisor_children.supervisor_id=?
+            """, (date, user["id"])).fetchall()
+
+        city_schedules = {}
+        rows = []
+        for child in roster:
+            city = CITIES_BY_ID.get(child["city_id"])
+            record = row_day(child) if child["date"] is not None else blank_day(date)
+            if city is None:
+                day = snapshot(record)
+            else:
+                if city["id"] not in city_schedules:
+                    today = instant.astimezone(ZoneInfo(city["timezone"])).date().isoformat()
+                    if date != today:
+                        schedule = {"available": False, "timezone": city["timezone"], "today": today,
+                                    "times": None, "eligible_prayers": list(PRAYER_KEYS) if date < today else [],
+                                    "error": "المواقيت متاحة عند فتح اليوم"}
+                    else:
+                        schedule = {**schedules.schedule(city, date), "today": today}
+                        schedule["eligible_prayers"] = (
+                            [key for key in PRAYER_KEYS if datetime.fromisoformat(schedule["times"][key]) <= instant]
+                            if schedule["available"] else None
+                        )
+                    city_schedules[city["id"]] = schedule
+                day = snapshot(record, city_schedules[city["id"]], scheduled=True)
+            rows.append({
+                "student": {"id": child["id"], "alias": child["alias"], "city_id": child["city_id"],
+                            "timezone": city["timezone"] if city else None},
+                "has_record": child["date"] is not None, "day": day,
+            })
+
+        # Schedule work runs outside a transaction; verify current grants before paging.
+        with database.connect() as conn:
+            supervisor = conn.execute("SELECT can_supervise FROM users WHERE id=?", (user["id"],)).fetchone()
+            if supervisor is None or not supervisor["can_supervise"]:
+                raise HTTPException(403, "فعّل الإشراف من حسابي أولًا")
+            authorized = {row["child_id"] for row in conn.execute(
+                "SELECT child_id FROM supervisor_children WHERE supervisor_id=?", (user["id"],))}
+        rows = [row for row in rows if row["student"]["id"] in authorized]
+        aliases = {child["id"]: child["alias_key"] for child in roster}
+
+        def order(row):
+            stats = row["day"]["stats"]
+            unknown = stats["completed"] is None
+            return (unknown, -(stats["completed"] or 0), -(stats["silver_medals"] or 0),
+                    aliases[row["student"]["id"]], row["student"]["id"])
+
+        rows.sort(key=order)
+        return {"date": date, "generated_at": instant.isoformat().replace("+00:00", "Z"),
+                "limit": limit, "offset": offset, "total_students": len(rows),
+                "rows": rows[offset:offset + limit]}
+
+    @app.delete("/api/v1/supervisor/children/{child_id}")
+    def remove_child(child_id: int, user: dict = Depends(current_user)):
+        require_supervisor(user)
+        with database.connect() as conn:
+            conn.execute("DELETE FROM supervisor_children WHERE supervisor_id=? AND child_id=?", (user["id"], child_id))
+        return {"ok": True}
+
+    def supervised_child(user: dict, child_id: int) -> dict:
+        require_supervisor(user)
+        with database.connect() as conn:
+            row = conn.execute("""
+                SELECT users.* FROM users JOIN supervisor_children ON child_id=users.id
+                WHERE supervisor_id=? AND child_id=?
+            """, (user["id"], child_id)).fetchone()
+        if row is None:
+            raise HTTPException(403, "لا تملك صلاحية متابعة هذا الحساب أو أُزيل الإشراف")
+        return user_view(row)
+
+    @app.get("/api/v1/supervisor/children/{child_id}/days/{day}")
+    def child_day(child_id: int, day: str, user: dict = Depends(current_user)):
+        child = supervised_child(user, child_id)
+        result = get_day(day, child)
+        supervised_child(user, child_id)
+        return result
+
+    @app.get("/api/v1/supervisor/children/{child_id}/history")
+    def child_history(child_id: int, start: str | None = Query(default=None, alias="from"),
+                      end: str | None = Query(default=None, alias="to"), user: dict = Depends(current_user)):
+        child = supervised_child(user, child_id)
+        result = history(start, end, child)
+        supervised_child(user, child_id)
+        return result
+
+    @app.get("/api/v1/supervisor/children/{child_id}/statistics")
+    def child_statistics(child_id: int, start: str | None = Query(default=None, alias="from"),
+                         end: str | None = Query(default=None, alias="to"), user: dict = Depends(current_user)):
+        child = supervised_child(user, child_id)
+        result = statistics(start, end, child)
+        supervised_child(user, child_id)
+        return result
 
     @app.post("/api/v1/auth/logout")
     def logout(request: Request, response: Response, user: dict = Depends(current_user)):

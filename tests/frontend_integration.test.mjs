@@ -107,8 +107,17 @@ test('frontend registration, prayer/sunnah controls, history and auth use the li
   await click({action:'logout'});await listeners.submit({target:form,preventDefault(){}});
   assert.ok(root.innerHTML.includes('٦٠٪'));
 
-  await click({action:'view',view:'achievements'});assert.equal((root.innerHTML.match(/class="achievement-badge /g)||[]).length,4);assert.equal((root.innerHTML.match(/class="history-row"/g)||[]).length,1);
+  await click({action:'view',view:'achievements'});assert.equal((root.innerHTML.match(/class="achievement-badge /g)||[]).length,4);assert.equal((root.innerHTML.match(/data-action="history-date"/g)||[]).length,1);
   assert.equal((root.innerHTML.match(/data-action="achievement-period"/g)||[]).length,3);
+  assert.match(root.innerHTML,/class="report-table"/);
+  assert.equal((root.innerHTML.match(/class="report-record /g)||[]).length,12);
+  assert.match(root.innerHTML,/الوتر: مكتمل/);
+  assert.doesNotMatch(root.innerHTML,/mini-progress|history-list/);
+  await click({action:'history-date',date:today});
+  assert.equal((root.innerHTML.match(/class="prayer-row /g)||[]).length,5,'own history date returns to the editable diary');
+  assert.equal((await snapshot()).stats.percent,60);
+  await click({action:'view',view:'achievements'});
+
   await click({action:'achievement-period',period:'week'});assert.match(root.innerHTML,/هذا الأسبوع/);
   await click({action:'achievement-period',period:'month'});assert.match(root.innerHTML,/هذا الشهر/);
   await click({action:'achievement-period',period:'last30'});assert.match(root.innerHTML,/آخر ٣٠ يومًا/);

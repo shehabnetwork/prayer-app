@@ -45,6 +45,52 @@ multi-worker/public deployment needs an appropriate shared abuse-control layer.
 
 ## Authentication
 
+### Supervisor accounts and shared invitation links
+
+Registration accepts optional `account_type: "child" | "supervisor"` (default
+`"child"`). Login still accepts only alias and password. User responses include
+`can_supervise`; existing accounts start with `false`. An account may enable
+supervision with `PATCH /account` and `{ "can_supervise": true }` while retaining
+its own prayer diary. Supervision grants read access to linked children's prayer
+days, full history and statistics, not permission to edit their records or city.
+
+All paths below have the `/api/v1` prefix:
+
+| Method / path | Purpose |
+| --- | --- |
+| `POST /supervisor/invites` | Create the supervisor's shared link; an existing active link returns `409` |
+| `POST /supervisor/invites/rotate` | Replace the active link and invalidate previous copies |
+| `GET /supervisor/invites` | List link metadata without raw tokens |
+| `DELETE /supervisor/invites/{id}` | Revoke an owned link |
+| `POST /supervisor-invites/preview` | Preview the supervisor using `{ "token": "…" }` |
+| `POST /supervisor-invites/accept` | Explicit authenticated consent with `{ "token": "…", "request_key": "unique-operation-key" }` |
+| `GET /account/supervisors` | List the current account's supervisors |
+| `DELETE /account/supervisors/{id}` | Remove one supervisor |
+| `GET /supervisor/children` | List the supervisor's linked children |
+| `DELETE /supervisor/children/{id}` | End the supervisor's relationship with one child |
+| `GET /supervisor/children/{id}/days/{date}` | Read an authorized child's day |
+| `GET /supervisor/children/{id}/history` | Read history with the existing `from`/`to` limits |
+| `GET /supervisor/children/{id}/statistics` | Read statistics with the existing date-range rules |
+
+A single link can be sent manually to all siblings or a class group. Each child
+must sign in and accept independently. Links have no automatic expiry and remain
+usable until revoked or replaced. Replacing a link leaves existing relationships
+intact. A child can have multiple supervisors. Removing one relationship does
+not change others; later data requests require a current relationship.
+
+Creation and rotation return the raw token once; the database stores only its
+hash. Keep the resulting link for reuse. A lost link can be replaced, not recovered
+from its hash. The secret uses the URL fragment `/#invite=TOKEN` and is sent in a
+POST body, never as an API query parameter. `PRAYER_TRUSTED_ORIGIN` supplies the
+external origin for a configured deployment; otherwise the frontend uses its own
+origin. Link preview or login never establishes supervision automatically.
+
+Reuse the same `request_key` when retrying one acceptance operation. A retry
+after unlinking cannot restore access; a fresh explicit acceptance needs a new
+key. Concurrent children can accept the same link independently, while repeated
+acceptance cannot create duplicate relationships. The child's city and timezone
+are used for the supervisor's view.
+
 All routes below use the prefix `/api/v1`.
 
 | Method / path | Body | Result |
@@ -188,3 +234,20 @@ local JavaScript modules rather than inline scripts.
 Day snapshots include schedule metadata and ISO prayer timestamps. Waiting is a derived display state, not a fourth stored integer. Today uses elapsed prayer times for `total`, `percent`, `gold_target`, and `silver_target`; past days retain 5/135/7. Silver target weights are Fajr 1, Dhuhr 3, Asr 0, Maghrib 1, and Isha 2 (including Witr). All mutation routes enforce schedule eligibility, including bulk updates.
 
 Schedules come from the [AlAdhan prayer times API](https://aladhan.com/prayer-times-api), with regional calculation methods. Only the selected city’s catalog coordinates, date, timezone, and calculation method are sent to the provider. Provider failures must not invent times or completion percentages; today’s gated controls remain unavailable until a schedule is obtained. Tests mock the clock and provider instead of making live requests.
+
+### Supervisor daily review
+
+`GET /api/v1/supervisor/daily-review?date=YYYY-MM-DD&limit=50&offset=0`
+returns `{date,generated_at,limit,offset,total_students,rows}`. Each row contains
+`student` (ID, alias, city ID and timezone), `has_record`, and `day` with the raw
+prayer states, independent Dhuhr-before blocks, Sunnah/Witr fields, statistics,
+and schedule metadata. Missing records remain blank and are not inserted.
+
+Rows are sorted across the entire currently authorized roster before pagination:
+completed eligible fard count descending, completed eligible Sunnah controls
+descending, then normalized alias and ID. Gold medal values do not determine
+ordering; unknown eligibility totals sort last. `limit` is 1–100 (default 50),
+`offset` is nonnegative. The endpoint requires supervisor capability and rechecks
+relationships after schedule work. Past-day reports avoid upstream schedule calls;
+current-day work is grouped by student city with one captured calculation instant.
+The roster is live rather than a historical membership snapshot.
