@@ -3,15 +3,23 @@
 Use shared discovery notes to avoid repeating repository exploration.
 
 ### Repository map
-- Use `docs/repo-map.md` as a navigation aid.
+- Start repository discovery with the relevant sections of `docs/repo-map.md`
+  before searching source files. Keep the map in English as the shared reference
+  for understanding how the current application is implemented.
 - If it is missing, create a concise initial map when a task requires
   broad repository exploration. Do not scan the entire repository solely
   to produce exhaustive documentation.
 - Include major components, responsibilities, important entry points,
   relevant paths, and verified build/test commands.
+- Map each implemented feature to its frontend/backend entry points, key
+  symbols, storage or external dependencies, and relevant tests. Explain the
+  important data flows and configuration choices concisely.
 - Record the commit inspected. Mark unverified information explicitly.
 - Read only sections relevant to the current task.
-- Update affected sections when implementation changes make them inaccurate.
+- After implementing any new feature, update the affected sections of
+  `docs/repo-map.md` before completing the task. Also update it after fixes,
+  refactors, or configuration changes that make its descriptions inaccurate.
+  Describe the final code rather than appending a chronological change log.
 - Current source code is authoritative; verify relevant code before editing.
 
 ### Task discovery notes
