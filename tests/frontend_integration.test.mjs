@@ -44,7 +44,7 @@ test('frontend registration, prayer/sunnah controls, history and auth use the li
   for(let i=0;!root.innerHTML.includes('auth-form');i++){assert.ok(i<100,'initial auth render');await delay(20);}
   const click=async dataset=>listeners.click({target:{closest(){return {dataset,disabled:false};}}});
   await click({action:'auth-mode',mode:'register'});
-  const form={id:'auth-form',values:{alias:'بطل_اختبار',password:randomBytes(24).toString('base64url')},querySelector(){return dummyField();}};
+  const form={id:'auth-form',values:{alias:'بطل_اختبار',display_name:'بطل_اختبار',password:randomBytes(24).toString('base64url')},querySelector(){return dummyField();}};
   await listeners.submit({target:form,preventDefault(){}});
   assert.equal((root.innerHTML.match(/class="prayer-row /g)||[]).length,5);
   assert.equal((root.innerHTML.match(/class="character-button /g)||[]).length,5);
@@ -98,7 +98,7 @@ test('frontend registration, prayer/sunnah controls, history and auth use the li
   holdResponse={matches:(url,options)=>url===`/api/v1/days/${today}`,promise:new Promise(resolve=>releaseIdentity=resolve),started:identityStarted};
   const oldAccountRead=click({action:'history-date',date:today});await identityStartedPromise;
   await click({action:'logout'});await click({action:'auth-mode',mode:'register'});
-  const otherForm={id:'auth-form',values:{alias:'قمر_اختبار',password:randomBytes(24).toString('base64url')},querySelector(){return dummyField();}};
+  const otherForm={id:'auth-form',values:{alias:'قمر_اختبار',display_name:'قمر_اختبار',password:randomBytes(24).toString('base64url')},querySelector(){return dummyField();}};
   await listeners.submit({target:otherForm,preventDefault(){}});
   assert.ok(root.innerHTML.includes('٠٪'));
   releaseIdentity();await oldAccountRead;

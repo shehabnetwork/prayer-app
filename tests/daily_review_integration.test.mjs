@@ -29,8 +29,9 @@ test('daily roster shows detailed medals, server ordering, date navigation and i
   const register=alias=>api('','/auth/register','POST',{alias,password:randomBytes(24).toString('hex'),...(alias==='daily-teacher'?{account_type:'supervisor'}:{})});
   const teacher=await register('daily-teacher');activeToken=teacher.access_token;
   const children=await Promise.all(['high-record','lower-record','empty-record'].map(register));
-  const invite=await api(activeToken,'/supervisor/invites','POST');
-  for(const child of children)await api(child.access_token,'/supervisor-invites/accept','POST',{token:invite.token,request_key:randomBytes(16).toString('hex')});
+  const group=(await api(activeToken,'/groups','POST',{name:'daily-group'})).group;
+  const invite=await api(activeToken,`/groups/${group.id}/invite-link`,'POST');
+  for(const child of children)await api(child.access_token,'/group-invites/accept','POST',{token:invite.token,request_key:randomBytes(16).toString('hex')});
   const yesterday=shiftDate(localDate(),-1);
   await api(children[0].access_token,`/days/${yesterday}`,'PUT',{version:0,prayers:{fajr:2,dhuhr:2,asr:1,maghrib:0,isha:0},sunnah:{fajr_before:2,dhuhr_before:2,dhuhr_after:2,maghrib_after:0,isha_after:0,witr:true},dhuhr_before_blocks:[false,true]});
   await api(children[1].access_token,`/days/${yesterday}`,'PUT',{version:0,prayers:{fajr:2,dhuhr:0,asr:0,maghrib:0,isha:0},sunnah:{fajr_before:0,dhuhr_before:0,dhuhr_after:0,maghrib_after:0,isha_after:0,witr:false},dhuhr_before_blocks:[false,false]});
@@ -43,16 +44,17 @@ test('daily roster shows detailed medals, server ordering, date navigation and i
    const response=await originals.fetch(base+url,{...options,headers:{...options.headers,Origin:base,...(activeToken?{Authorization:`Bearer ${activeToken}`}:{})}});
    if(hold&&(hold.matches?hold.matches(url,options):String(url).includes('/daily-review'))){const h=hold;hold=null;h.started();await h.promise;}
    if(reportTransform&&String(url).includes('/daily-review')){const data=reportTransform(await response.json());return {ok:response.ok,status:response.status,json:async()=>data};}
-   if(dayTransform&&String(url).includes('/supervisor/children/')&&String(url).includes('/days/')){const data=dayTransform(await response.json());return {ok:response.ok,status:response.status,json:async()=>data};}
+   if(dayTransform&&String(url).includes('/members/')&&String(url).includes('/days/')){const data=dayTransform(await response.json());return {ok:response.ok,status:response.status,json:async()=>data};}
    return response;
   };
   await import('../frontend/app.js');
-  for(let i=0;!root.innerHTML.includes('data-view="report"');i++){assert.ok(i<120,'supervisor navigation');await delay(20);}
+  for(let i=0;!root.innerHTML.includes('data-view="groups"');i++){assert.ok(i<120,'supervisor navigation');await delay(20);}
   const click=dataset=>listeners.click({target:{closest(){return {dataset,disabled:false};}}});
+  await click({action:'view',view:'groups'});
   await click({action:'view',view:'report'});
   assert.match(root.innerHTML,new RegExp(`value="${yesterday}"`));
-  assert.deepEqual([...root.innerHTML.matchAll(/class="report-heading">([^<]+)</g)].map(match=>match[1]),['الطالب','الفجر','الظهر','العصر','المغرب','العشاء','الإجمالي']);
-  const studentRow=id=>root.innerHTML.match(new RegExp(`<tr data-student-id="${id}">([\\s\\S]*?)</tr>`))[1];
+  assert.deepEqual([...root.innerHTML.matchAll(/class="report-heading">([^<]+)</g)].map(match=>match[1]),['العضو','الفجر','الظهر','العصر','المغرب','العشاء','الإجمالي']);
+  const studentRow=id=>root.innerHTML.match(new RegExp(`<tr data-member-id="${id}">([\\s\\S]*?)</tr>`))[1];
   const highRow=studentRow(children[0].user.id),emptyRow=studentRow(children[2].user.id);
   for(const row of [highRow,emptyRow]){assert.equal((row.match(/<td(?: |\/?>)/g)||[]).length,6);assert.equal((row.match(/class="report-record /g)||[]).length,12);}
   const labels=[...highRow.matchAll(/class="report-record [^"]*" aria-label="([^"]+)"/g)].map(match=>match[1]);
@@ -93,8 +95,8 @@ test('daily roster shows detailed medals, server ordering, date navigation and i
   await click({action:'report-shift',days:'-1'});const newest=shiftDate(yesterday,-2);release();await old;
   assert.match(root.innerHTML,new RegExp(`value="${newest}"`));assert.doesNotMatch(root.innerHTML,/🥇 ٥٥/);
   await click({action:'report-yesterday'});assert.match(root.innerHTML,/🥇 ٥٥/);
-  await click({action:'report-child',id:String(children[0].user.id)});
-  assert.match(root.innerHTML,/العودة إلى سجل الطلاب/);assert.match(root.innerHTML,/high-record/);
+  await click({action:'report-member',id:String(children[0].user.id)});
+  assert.match(root.innerHTML,/العودة إلى سجل المجموعة/);assert.match(root.innerHTML,/high-record/);
   assert.equal((root.innerHTML.match(/class="report-table"/g)||[]).length,1);
   assert.equal((root.innerHTML.match(/class="report-record /g)||[]).length,12);
   assert.match(root.innerHTML,/سنة الظهر القبلية، المجموعة ١: غير مسجّل/);
@@ -112,7 +114,7 @@ test('daily roster shows detailed medals, server ordering, date navigation and i
   await click({action:'history-date',date:yesterday});
   assert.match(root.innerHTML,new RegExp(`id="day-date" value="${yesterday}"`));
   assert.match(root.innerHTML,/class="report-table"/);
-  assert.match(root.innerHTML,/العودة إلى سجل الطلاب/);
+  assert.match(root.innerHTML,/العودة إلى سجل المجموعة/);
   // Full diary schedules omit eligible_prayers; the shared table uses prayer times.
   dayTransform=day=>({...day,schedule:{today:yesterday,available:true,times:Object.fromEntries(['fajr','dhuhr','asr','maghrib','isha'].map(key=>[key,new Date(Date.now()+3600000).toISOString()]))}});
   await click({action:'history-date',date:yesterday});
@@ -128,10 +130,11 @@ test('daily roster shows detailed medals, server ordering, date navigation and i
   // A late management response must refresh an active report, not strand its spinner.
   await click({action:'view',view:'account'});
   let unlinkStarted,unlinkRelease;const unlinkStart=new Promise(r=>unlinkStarted=r),unlinkPromise=new Promise(r=>unlinkRelease=r);
-  hold={started:unlinkStarted,promise:unlinkPromise,matches:(url,options)=>String(url).endsWith(`/supervisor/children/${children[2].user.id}`)&&options.method==='DELETE'};
-  const unlink=click({action:'remove-child',id:String(children[2].user.id)});await unlinkStart;
+  hold={started:unlinkStarted,promise:unlinkPromise,matches:(url,options)=>String(url).endsWith(`/groups/${group.id}/members/${children[2].user.id}`)&&options.method==='DELETE'};
+  const unlink=click({action:'remove-member',id:String(children[2].user.id)});await unlinkStart;
   await click({action:'view',view:'report'});unlinkRelease();await unlink;
-  assert.match(root.innerHTML,/high-record/);assert.doesNotMatch(root.innerHTML,/نحمّل سجل الطلاب/);assert.doesNotMatch(root.innerHTML,/empty-record/);
+  await click({action:'view',view:'report'});
+  assert.match(root.innerHTML,/high-record/);assert.doesNotMatch(root.innerHTML,/نحمّل سجل الأعضاء/);assert.doesNotMatch(root.innerHTML,/empty-record/);
   await click({action:'report-today'});assert.match(root.innerHTML,/data-action="report-shift" data-days="1"[^>]*disabled/);
   await click({action:'report-shift',days:'1'});assert.match(root.innerHTML,new RegExp(`value="${localDate()}"`));
   // Logout while a report response is in flight cannot expose that report.

@@ -55,11 +55,11 @@ python -m backend.import_sqlite --source backend/data/prayer.sqlite3 --dry-run
 python -m backend.import_sqlite --source backend/data/prayer.sqlite3
 ```
 
-5. Start the application with `PRAYER_DATABASE_URL`. Verify login, existing sessions, prayer history, relationships, invitation acceptance, and the daily report before reopening writes.
+5. Start the application with `PRAYER_DATABASE_URL`. Verify login, existing sessions, prayer history, groups, invitation acceptance, record visibility, and the daily report before reopening writes.
 
-The importer opens SQLite read-only and takes a consistent snapshot. It rejects unsupported/corrupt schema/data, locks the target tables, refuses any preexisting application rows, and copies all six tables in foreign-key order within one PostgreSQL transaction. It compares complete values and row counts, preserving IDs, JSON text, hashes, receipt keys, and timestamps. Identity sequences are reset for subsequent account/invitation creation. A failed import or dry run does not retain copied rows. Run during a write outage; a successful snapshot does not include SQLite writes made after it was captured.
+The importer opens SQLite read-only and takes a consistent snapshot. It rejects unsupported/corrupt schema/data, locks the target tables, refuses any preexisting application rows, and copies the ten application tables (including inert legacy tables and four authoritative group tables) in foreign-key order within one PostgreSQL transaction. It compares complete values and row counts, preserving IDs, JSON text, hashes, receipt keys, and timestamps. Identity sequences for users, legacy invitations, groups and group invitations are reset for subsequent creation. The initialized target retains its migration ledgers. A failed import or dry run does not retain copied rows. Run during a write outage; a successful snapshot does not include SQLite writes made after it was captured.
 
-Legacy SQLite databases without city/supervision columns receive the previous defaults. Password resets are unnecessary; stored hashes remain identical. No raw password or invitation secret is exported.
+Legacy SQLite databases without city/supervision columns receive the previous defaults. Legacy relationships and invitation hashes/receipts are converted into private groups in the read-only in-memory snapshot. Already migrated sources must contain all four group tables and the `groups_v1` marker in `app_migrations`; group data remains authoritative even when inert legacy rows disagree. Partial group schemas are rejected. Complete older group snapshots without `share_token` remain supported with null defaults; newer snapshots preserve recoverable tokens and validate their lookup hashes. Migration `003_durable_group_links.sql` and SQLite marker `groups_v2` add canonical link storage without rotating existing invitations. Database backups now contain usable invitation tokens and must retain the same access protections as the database. Startup runs PostgreSQL migration `002_groups.sql` or the transactional SQLite `groups_v1` conversion exactly once, so leaving a group is not undone on restart. Password resets are unnecessary; stored hashes remain identical. No raw password or invitation secret is exported.
 
 Rollback before reopening writes: stop the app, remove `PRAYER_DATABASE_URL`, and restore `PRAYER_DB_PATH` to the preserved SQLite source. After PostgreSQL receives new writes, reverting would lose them; there is no automatic reverse import or dual-write mechanism.
 
@@ -74,10 +74,10 @@ PYTHON="$PWD/.venv/bin/python" npm test
 npm run check
 ```
 
-The PostgreSQL suite reuses existing API, supervision, schedule, and report tests and adds first-day/version races, retry receipts, reciprocal supervision, and importer checks. SQLite-specific legacy fixtures remain covered by the SQLite suite. Without the test URL, PostgreSQL tests are explicitly skipped, not claimed as passing.
+The PostgreSQL suite reuses existing API, groups, schedule, and report tests and adds first-day/version races, retry receipts, invite revocation races and group visibility checks, and importer checks. SQLite-specific legacy fixtures remain covered by the SQLite suite. Without the test URL, PostgreSQL tests are explicitly skipped, not claimed as passing.
 
 ## Deployment notes
 
 Use a persistent managed PostgreSQL database or a separately backed-up database service, HTTPS, secure cookies, and `PRAYER_TRUSTED_ORIGIN` for the external origin. Require TLS to a remote database where supported (e.g. the provider's required `sslmode`). Use restricted database credentials and keep connection URLs out of logs.
 
-PostgreSQL transactions use consistent user-row locks to serialize conflicting application operations. Day updates lock the owner; invitation/relationship operations lock the relevant users in ascending ID order. The current in-memory rate limiter is still per process: database migration alone does not make it shared across workers.
+PostgreSQL transactions use consistent user-row locks to serialize conflicting application operations. Day updates lock the owner; group membership, settings and invitation changes lock the group row. Acceptance additionally locks the accepting user to serialize request keys across groups. Record authorization checks both memberships and visibility together and rechecks grants after external schedule work. The current in-memory rate limiter is still per process: database migration alone does not make it shared across workers.

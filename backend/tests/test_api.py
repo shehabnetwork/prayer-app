@@ -37,6 +37,42 @@ class APITests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 201, response.text)
         return response.json()
 
+    async def test_display_name_is_independent_nonunique_and_editable(self):
+        auth = await self.register(alias="original-login")
+        self.assertEqual(auth["user"]["display_name"], "original-login")
+        changed = await self.client.patch("/api/v1/account", json={"display_name": "  الاسم الظاهر  "})
+        self.assertEqual(changed.status_code, 200, changed.text)
+        self.assertEqual(changed.json()["user"]["display_name"], "الاسم الظاهر")
+        self.assertEqual(changed.json()["user"]["alias"], "original-login")
+        other = self.new_client()
+        self.clients.append(other)
+        response = await other.post("/api/v1/auth/register", json={"alias": "other-login", "password": self.password,
+                                                                  "display_name": "الاسم الظاهر"})
+        self.assertEqual(response.status_code, 201, response.text)
+        for alias, status in (("original-login", 200), ("الاسم الظاهر", 401)):
+            response = await self.client.post("/api/v1/auth/login", json={"alias": alias, "password": self.password})
+            self.assertEqual(response.status_code, status, response.text)
+            if status == 200:
+                self.assertEqual(response.json()["user"]["display_name"], "الاسم الظاهر")
+        restarted = self.new_client(create_app(self.path))
+        self.clients.append(restarted)
+        response = await restarted.get("/api/v1/auth/me", headers={"Authorization": f"Bearer {auth['access_token']}"})
+        self.assertEqual(response.json()["user"]["display_name"], "الاسم الظاهر")
+
+    async def test_invalid_display_names_are_rejected_without_changing_alias(self):
+        await self.register()
+        for name in (None, "", "   ", "x" * 81, "a\nb", "a\tb", "a\u200bb", 12):
+            for path, payload in (("/api/v1/account", {"display_name": name}),
+                                  ("/api/v1/auth/register", {"alias": "new-login", "password": self.password,
+                                                             "display_name": name})):
+                response = await (self.client.patch(path, json=payload) if path.endswith("account")
+                                  else self.client.post(path, json=payload))
+                self.assertEqual(response.status_code, 422, (name, response.text))
+        response = await self.client.patch("/api/v1/account", json={"display_name": " x "})
+        self.assertEqual(response.json()["user"]["display_name"], "x")
+        response = await self.client.patch("/api/v1/account", json={"display_name": "x" * 80})
+        self.assertEqual(response.status_code, 200)
+
     async def test_registration_cookie_hashing_and_me(self):
         auth = await self.register()
         self.assertEqual(auth["user"]["alias"], "نجم تجريبي")
@@ -76,7 +112,7 @@ class APITests(unittest.IsolatedAsyncioTestCase):
         for alias, password in (("Sample-Star", "wrong-password"), ("Unknown-Star", "wrong-password")):
             response = await self.client.post("/api/v1/auth/login", json={"alias": alias, "password": password})
             self.assertEqual(response.status_code, 401)
-            self.assertEqual(response.json()["detail"], "الاسم المستعار أو كلمة المرور غير صحيحة")
+            self.assertEqual(response.json()["detail"], "اسم المستخدم أو كلمة المرور غير صحيحة")
         response = await self.client.post("/api/v1/auth/login", json={"alias": "sample-star", "password": self.password})
         self.assertEqual(response.status_code, 200)
         token = response.json()["access_token"]

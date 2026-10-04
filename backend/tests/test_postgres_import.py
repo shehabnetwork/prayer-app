@@ -59,17 +59,87 @@ class SnapshotTests(unittest.TestCase):
     def test_read_only_exact_data(self):
         before = hashlib.sha256(self.path.read_bytes()).digest()
         data = read_snapshot(self.path)
-        self.assertEqual(data["users"][0], (7, "fixture-parent", "fixture-parent", "hash-parent", 123.25, "riyadh", 1))
+        self.assertEqual(data["users"][0], (7, "fixture-parent", "fixture-parent", "hash-parent", 123.25, "riyadh", 1, "fixture-parent"))
         self.assertEqual(data["days"][0][-2:], (8, 1234.125))
         self.assertEqual(data["supervisor_invite_acceptances"][0], (40, 21, "fixture-request-key", 224.5))
         self.assertEqual(before, hashlib.sha256(self.path.read_bytes()).digest())
+
+    def test_display_name_migration_preserves_edits_and_imports_names(self):
+        from backend.database import Database
+        database = Database(self.path)
+        with database.connect() as conn:
+            self.assertEqual(conn.execute('SELECT display_name FROM users WHERE id=7').fetchone()[0], 'fixture-parent')
+            conn.execute('UPDATE users SET display_name=? WHERE id=7', ('اسم جديد',))
+        Database(self.path)
+        self.assertEqual(read_snapshot(self.path)['users'][0][-1], 'اسم جديد')
+        with database.connect() as conn:
+            conn.execute('UPDATE users SET display_name=? WHERE id=7', ('bad\nname',))
+        with self.assertRaises(ImportValidationError):
+            read_snapshot(self.path)
 
     def test_legacy_defaults(self):
         path = Path(self.temp.name) / "legacy.sqlite3"
         fixture(path, legacy=True)
         data = read_snapshot(path)
-        self.assertEqual(data["users"][0][-2:], (None, 0))
+        self.assertEqual(data["users"][0][-3:], (None, 0, "fixture-parent"))
         self.assertEqual(data["supervisor_invites"], [])
+
+    def test_legacy_groups_and_new_snapshot_do_not_resurrect_memberships(self):
+        from backend.database import Database
+        old = read_snapshot(self.path)
+        self.assertEqual(old["groups"][0][2:4], (7, 0))
+        self.assertIn((7,21,222.5), old["group_members"])
+        self.assertEqual(old["group_invites"][0], (40,7,"invite-hash",223.5,None,None))
+        database = Database(self.path)
+        with database.connect() as conn:
+            conn.execute("DELETE FROM group_members WHERE user_id=21")
+        new = read_snapshot(self.path)
+        self.assertFalse(any(row[1] == 21 for row in new["group_members"]))
+        self.assertEqual(new["supervisor_children"], [(7,21,222.5)])
+        self.assertEqual(new["group_invite_acceptances"], [(40,21,"fixture-request-key",224.5)])
+
+    def test_old_complete_groups_snapshot_remains_authoritative(self):
+        from backend.database import Database
+        database = Database(self.path)
+        with database.connect() as conn:
+            conn.execute('DELETE FROM group_members WHERE user_id=21')
+            conn.execute('DROP INDEX group_active_share_invite')
+            conn.execute('DROP INDEX group_active_legacy_invite')
+            conn.execute('ALTER TABLE group_invites DROP COLUMN share_token')
+            conn.execute("DELETE FROM app_migrations WHERE name='groups_v2'")
+        data = read_snapshot(self.path)
+        self.assertFalse(any(row[1] == 21 for row in data['group_members']))
+        self.assertEqual(data['group_invites'][0][-1], None)
+        upgraded = Database(self.path)
+        with upgraded.connect() as conn:
+            self.assertIsNotNone(conn.execute("SELECT 1 FROM app_migrations WHERE name='groups_v2'").fetchone())
+            self.assertIsNone(conn.execute('SELECT 1 FROM group_members WHERE user_id=21').fetchone())
+
+    def test_durable_snapshot_preserves_and_validates_tokens(self):
+        from backend.database import Database
+        database = Database(self.path)
+        token = 'A' * 43
+        hashed = hashlib.sha256(token.encode()).hexdigest()
+        with database.connect() as conn:
+            conn.execute('INSERT INTO group_invites(group_id,token_hash,created_at,share_token) SELECT id,?,0,? FROM groups WHERE admin_id=7', (hashed, token))
+        data = read_snapshot(self.path)
+        self.assertIn(token, [row[-1] for row in data['group_invites']])
+        with database.connect() as conn:
+            conn.execute('UPDATE group_invites SET share_token=? WHERE share_token IS NOT NULL', ('B'*43,))
+        with self.assertRaises(ImportValidationError):
+            read_snapshot(self.path)
+
+    def test_partial_group_schema_rejected(self):
+        with sqlite3.connect(self.path) as conn:
+            conn.execute("CREATE TABLE groups(id INTEGER,name TEXT,admin_id INTEGER,members_can_view_records INTEGER,created_at REAL)")
+        with self.assertRaises(ImportValidationError):
+            read_snapshot(self.path)
+
+    def test_partial_group_schema_without_groups_is_not_legacy(self):
+        with sqlite3.connect(self.path) as conn:
+            conn.execute("CREATE TABLE group_members(group_id INTEGER,user_id INTEGER,created_at REAL)")
+        with self.assertRaises(ImportValidationError):
+            read_snapshot(self.path)
 
     def test_invalid_json_and_broken_foreign_key_rejected(self):
         with sqlite3.connect(self.path) as conn:
@@ -113,17 +183,31 @@ class PostgresImportTests(unittest.TestCase):
         with self.db.connect() as conn:
             for table, rows in data.items():
                 self.assertEqual(conn.execute(f'SELECT COUNT(*) AS count FROM "{table}"').fetchone()["count"], len(rows))
-            user = conn.execute("INSERT INTO users(alias,alias_key,password_hash,created_at) VALUES(?,?,?,?) RETURNING id", ("next-user", "next-user", "hash", 1.0)).fetchone()
+            user = conn.execute("INSERT INTO users(alias,alias_key,password_hash,created_at,display_name) VALUES(?,?,?,?,?) RETURNING id", ("next-user", "next-user", "hash", 1.0, "next-user")).fetchone()
             self.assertEqual(user["id"], 22)
             invite = conn.execute("INSERT INTO supervisor_invites(supervisor_id,token_hash,created_at,revoked_at) VALUES(?,?,?,?) RETURNING id", (7, "next-invite", 1.0, 2.0)).fetchone()
             self.assertEqual(invite["id"], 41)
         self.assertEqual(before, hashlib.sha256(self.path.read_bytes()).digest())
 
+    def test_import_preserves_canonical_link_alongside_legacy(self):
+        from backend.database import Database
+        source = Database(self.path)
+        token = 'A' * 43
+        hashed = hashlib.sha256(token.encode()).hexdigest()
+        with source.connect() as conn:
+            conn.execute('DELETE FROM group_members WHERE user_id=21')
+            conn.execute('INSERT INTO group_invites(group_id,token_hash,created_at,share_token) SELECT id,?,0,? FROM groups WHERE admin_id=7', (hashed, token))
+        import_sqlite(self.path, self.url, schema=self.schema)
+        with self.db.connect() as conn:
+            self.assertEqual(dict(conn.execute('SELECT token_hash,share_token FROM group_invites WHERE share_token IS NOT NULL').fetchone()), {'token_hash': hashed, 'share_token': token})
+            self.assertEqual(conn.execute('SELECT COUNT(*) FROM group_invites WHERE revoked_at IS NULL').fetchone()[0], 2)
+            self.assertIsNone(conn.execute('SELECT 1 FROM group_members WHERE user_id=21').fetchone())
+
     def test_dry_run_rolls_back_and_nonempty_target_is_refused(self):
         import_sqlite(self.path, self.url, schema=self.schema, dry_run=True)
         with self.db.connect() as conn:
             self.assertEqual(conn.execute("SELECT COUNT(*) AS count FROM users").fetchone()["count"], 0)
-            row = conn.execute("INSERT INTO users(alias,alias_key,password_hash,created_at) VALUES(?,?,?,?) RETURNING id", ("existing-user", "existing-user", "hash", 1.0)).fetchone()
+            row = conn.execute("INSERT INTO users(alias,alias_key,password_hash,created_at,display_name) VALUES(?,?,?,?,?) RETURNING id", ("existing-user", "existing-user", "hash", 1.0, "existing-user")).fetchone()
             self.assertEqual(row["id"], 1)
         with self.assertRaises(ImportValidationError):
             import_sqlite(self.path, self.url, schema=self.schema)

@@ -1,6 +1,6 @@
 # Prayer tracker API
 
-This local prototype uses aliases and passwords only. It does not request email,
+This local prototype uses login aliases, display names, and passwords. It does not request email,
 birth dates, precise device location, or a child's identity. An account can save a selected city for prayer times. Use fictitious accounts for evaluation.
 Do not put real children's data into this prototype without a separate privacy,
 parental-consent, safeguarding, and deployment review.
@@ -47,51 +47,82 @@ multi-worker/public deployment needs an appropriate shared abuse-control layer.
 
 ## Authentication
 
-### Supervisor accounts and shared invitation links
+`alias` remains the unique, case-insensitive login username. Registration accepts
+an independent `display_name`, trimmed to 1–80 characters with no control
+characters; names need not be unique. Older registration clients that omit it
+receive their alias as the initial name. Explicit null or invalid names fail
+validation. `PATCH /api/v1/account` accepts `display_name` to edit it without
+changing login credentials. Auth/account responses, group rosters and daily-report
+members include both fields; invitation metadata adds `admin_display_name` beside
+`admin_alias`. Existing SQLite and PostgreSQL users are backfilled from their
+aliases, and older SQLite imports receive the same fallback.
 
-Registration accepts optional `account_type: "child" | "supervisor"` (default
-`"child"`). Login still accepts only alias and password. User responses include
-`can_supervise`; existing accounts start with `false`. An account may enable
-supervision with `PATCH /account` and `{ "can_supervise": true }` while retaining
-its own prayer diary. Supervision grants read access to linked children's prayer
-days, full history and statistics, not permission to edit their records or city.
+### Groups and invitation links
+
+Every authenticated account can create multiple named groups. Creation adds the
+creator as admin and member, retaining their personal diary. Groups default to
+private records: only the admin can read other members' days, history and
+statistics. The admin can enable `members_can_view_records` so all current members
+can read one another's records, including the admin's. Writes remain owner-only.
+The admin cannot leave or remove themselves; ownership transfer is not supported.
 
 All paths below have the `/api/v1` prefix:
 
 | Method / path | Purpose |
 | --- | --- |
-| `POST /supervisor/invites` | Create the supervisor's shared link; an existing active link returns `409` |
-| `POST /supervisor/invites/rotate` | Replace the active link and invalidate previous copies |
-| `GET /supervisor/invites` | List link metadata without raw tokens |
-| `DELETE /supervisor/invites/{id}` | Revoke an owned link |
-| `POST /supervisor-invites/preview` | Preview the supervisor using `{ "token": "…" }` |
-| `POST /supervisor-invites/accept` | Explicit authenticated consent with `{ "token": "…", "request_key": "unique-operation-key" }` |
-| `GET /account/supervisors` | List the current account's supervisors |
-| `DELETE /account/supervisors/{id}` | Remove one supervisor |
-| `GET /supervisor/children` | List the supervisor's linked children |
-| `DELETE /supervisor/children/{id}` | End the supervisor's relationship with one child |
-| `GET /supervisor/children/{id}/days/{date}` | Read an authorized child's day |
-| `GET /supervisor/children/{id}/history` | Read history with the existing `from`/`to` limits |
-| `GET /supervisor/children/{id}/statistics` | Read statistics with the existing date-range rules |
+| `GET /groups` | Current account's groups, admin role and member counts |
+| `POST /groups` | Create with `{ "name": "My group", "members_can_view_records": false }`; atomically creates its invitation too |
+| `POST /groups/{group_id}/invite-link` | Admin retrieves the durable link; ensures a missing canonical invite under lock without rotating legacy links |
+| `GET /groups/{group_id}` | Member-only metadata, roster and `can_view_records` |
+| `PATCH /groups/{group_id}` | Admin edits name or record visibility |
+| `DELETE /groups/{group_id}/membership` | Non-admin leaves |
+| `DELETE /groups/{group_id}/members/{member_id}` | Admin removes a non-admin member |
+| `POST /groups/{group_id}/invites` | Admin creates reusable link; existing active link returns `409` |
+| `POST /groups/{group_id}/invites/rotate` | Replace active link |
+| `GET /groups/{group_id}/invites` | Admin lists metadata without secrets |
+| `DELETE /groups/{group_id}/invites/{invite_id}` | Admin revokes link |
+| `POST /group-invites/preview` | `{ "token": "…" }` returns name, admin alias and visibility without roster/records |
+| `POST /group-invites/accept` | Authenticated consent with `{ "token": "…", "request_key": "unique-operation-key" }` |
+| `GET /groups/{group_id}/members/{member_id}/days/{date}` | Read a permitted member day |
+| `GET /groups/{group_id}/members/{member_id}/history` | Read permitted history using `from`/`to` |
+| `GET /groups/{group_id}/members/{member_id}/statistics` | Read permitted statistics using `from`/`to` |
+| `GET /groups/{group_id}/daily-review` | Admin or shared-group members read sorted/paginated daily records; includes admin |
 
-A single link can be sent manually to all siblings or a class group. Each child
-must sign in and accept independently. Links have no automatic expiry and remain
-usable until revoked or replaced. Replacing a link leaves existing relationships
-intact. A child can have multiple supervisors. Removing one relationship does
-not change others; later data requests require a current relationship.
+Daily review accepts `date`, `limit` (1–100, default 50), and `offset`; response
+contains `total_members` and rows with `member`, `has_record`, and `day`.
+Member record routes check both current memberships and the group's current
+visibility in one query, then recheck after schedule/statistics work. Reports
+filter the roster through current grants before sorting and paging.
 
-Creation and rotation return the raw token once; the database stores only its
-hash. Keep the resulting link for reuse. A lost link can be replaced, not recovered
-from its hash. The secret uses the URL fragment `/#invite=TOKEN` and is sent in a
-POST body, never as an API query parameter. `PRAYER_TRUSTED_ORIGIN` supplies the
-external origin for a configured deployment; otherwise the frontend uses its own
-origin. Link preview or login never establishes supervision automatically.
+Admin-only `DELETE /api/v1/groups/{group_id}` atomically removes the group,
+memberships, invitations and acceptance receipts under the group lock. Personal
+accounts and prayer records remain intact. Deleted invitations cannot be used,
+and group-based record access ends immediately.
 
-Reuse the same `request_key` when retrying one acceptance operation. A retry
-after unlinking cannot restore access; a fresh explicit acceptance needs a new
-key. Concurrent children can accept the same link independently, while repeated
-acceptance cannot create duplicate relationships. The child's city and timezone
-are used for the supervisor's view.
+Group creation automatically inserts a canonical invitation. The admin copy
+control retrieves it through the origin-protected invite-link endpoint, including
+after reload or login. Its random token is recoverable from `share_token`, while
+lookup/acceptance uses the hash. Only admins receive this token; metadata, preview,
+acceptance and record responses exclude it. Existing hash-only links remain valid
+alongside the canonical invitation. The explicit invite administration endpoints
+are retained for compatibility, with deliberate rotation revoking all active links. Links have no automatic expiry;
+rotation/revocation prevents new joins without removing current members. The
+secret stays in `/#invite=TOKEN` and POST bodies, never API paths or queries.
+`PRAYER_TRUSTED_ORIGIN` supplies the share origin; otherwise the frontend uses its
+own origin. Preview/login never establishes membership. Invitations describe
+current visibility and explain that the admin can change it later.
+
+Reuse a `request_key` only to retry the same acceptance. Receipts never recreate
+removed membership: replay after leaving/removal returns `409`, requiring a new
+explicit acceptance. A key reused with another token also conflicts. Group
+mutation locks serialize joins, removal, visibility changes and invite changes.
+
+Startup converts each legacy supervisor with relationships or invitations to a
+private group exactly once, preserving current members, invitation hashes/IDs,
+revocations and receipts. Legacy tables remain inert; legacy supervisor routes
+return `410`. Existing invitation fragment links work through the new flow.
+`account_type`/`can_supervise` remain deprecated API/storage fields for old clients
+and data; they grant no group permissions and are absent from the new UI.
 
 All routes below use the prefix `/api/v1`.
 

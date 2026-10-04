@@ -84,6 +84,12 @@ class Connection:
             placeholders = ','.join('?' for _ in ids)
             self.execute(f'SELECT id FROM users WHERE id IN ({placeholders}) ORDER BY id FOR NO KEY UPDATE', ids).fetchall()
 
+    def lock_group(self, group_id):
+        if self.dialect == "sqlite":
+            self.execute("BEGIN IMMEDIATE")
+        else:
+            self.execute("SELECT id FROM groups WHERE id=? FOR UPDATE", (group_id,)).fetchall()
+
     def __getattr__(self, name):
         return getattr(self.raw, name)
 
@@ -172,11 +178,40 @@ class Database:
                     PRIMARY KEY(child_id, request_key)
                 );
             """)
+        self._migrate_display_names_sqlite()
+        self._migrate_groups_sqlite()
         # The file contains hashes and private progress: do not make it world-readable.
         try:
             os.chmod(self.path, 0o600)
         except OSError:
             pass
+
+    def _migrate_display_names_sqlite(self):
+        with self.connect() as conn:
+            conn.lock_users([])
+            columns = {row["name"] for row in conn.execute("PRAGMA table_info(users)")}
+            if "display_name" not in columns:
+                conn.execute("ALTER TABLE users ADD COLUMN display_name TEXT NOT NULL DEFAULT ''")
+                conn.execute("UPDATE users SET display_name=alias")
+
+    def _migrate_groups_sqlite(self):
+        from .groups_schema import SQLITE_SCHEMA, migrate_legacy
+        with self.connect() as conn:
+            conn.lock_group(0)
+            for statement in SQLITE_SCHEMA.split(";"):
+                if statement.strip():
+                    conn.execute(statement)
+            if not conn.execute("SELECT 1 FROM app_migrations WHERE name='groups_v1'").fetchone():
+                migrate_legacy(conn)
+                conn.execute("INSERT INTO app_migrations(name) VALUES('groups_v1')")
+            if not conn.execute("SELECT 1 FROM app_migrations WHERE name='groups_v2'").fetchone():
+                columns = {row['name'] for row in conn.execute('PRAGMA table_info(group_invites)')}
+                if 'share_token' not in columns:
+                    conn.execute('ALTER TABLE group_invites ADD COLUMN share_token TEXT')
+                conn.execute('DROP INDEX IF EXISTS group_active_invite')
+                conn.execute('CREATE UNIQUE INDEX IF NOT EXISTS group_active_legacy_invite ON group_invites(group_id) WHERE revoked_at IS NULL AND share_token IS NULL')
+                conn.execute('CREATE UNIQUE INDEX IF NOT EXISTS group_active_share_invite ON group_invites(group_id) WHERE revoked_at IS NULL AND share_token IS NOT NULL')
+                conn.execute("INSERT INTO app_migrations(name) VALUES('groups_v2')")
 
     def _connect_postgres(self, **kwargs):
         import psycopg

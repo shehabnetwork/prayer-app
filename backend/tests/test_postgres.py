@@ -10,7 +10,7 @@ import unittest
 from unittest.mock import patch
 
 from backend import main
-from backend.tests import test_api, test_daily_review, test_prayer_times, test_supervisors
+from backend.tests import test_api, test_daily_review, test_prayer_times, test_groups
 
 URL = os.environ.get('PRAYER_TEST_DATABASE_URL')
 
@@ -59,7 +59,7 @@ class PostgresAPITests(PostgresFixture, test_api.APITests):
         with ThreadPoolExecutor(max_workers=4) as executor:
             list(executor.map(lambda _: Database(URL, schema=schema), range(4)))
         with self.app.state.database.connect() as conn:
-            self.assertEqual(conn.execute('SELECT count(*) FROM schema_migrations').fetchone()[0], 1)
+            self.assertEqual(conn.execute('SELECT count(*) FROM schema_migrations').fetchone()[0], 4)
             conn.execute('INSERT INTO schema_migrations VALUES(?,?)', (999, 0))
         with self.assertRaises(RuntimeError):
             Database(URL, schema=schema)
@@ -109,78 +109,76 @@ class PostgresAPITests(PostgresFixture, test_api.APITests):
 
 
 @unittest.skipUnless(URL, 'set PRAYER_TEST_DATABASE_URL for real PostgreSQL validation')
-class PostgresSupervisorTests(PostgresFixture, test_supervisors.SupervisorTests):
-    base_module = test_supervisors
+class PostgresGroupTests(PostgresFixture, test_groups.GroupTests):
+    base_module = test_groups
 
-    @unittest.skip('SQLite legacy fixture; covered by SQLite suite and PostgreSQL importer tests')
-    async def test_existing_database_migration_is_repeatable(self):
+    async def test_populated_postgres_upgrade_preserves_links_and_runs_once(self):
+        from pathlib import Path
+        import psycopg
+        from psycopg import sql
+        from backend.database import Database
+
+        schema = 'test_group_upgrade_' + secrets.token_hex(10)
+        self.pg_schemas['legacy-upgrade'] = schema
+        with psycopg.connect(URL) as conn:
+            conn.execute(sql.SQL('CREATE SCHEMA {}').format(sql.Identifier(schema)))
+            conn.execute(sql.SQL('SET LOCAL search_path TO {}').format(sql.Identifier(schema)))
+            conn.execute((Path(main.__file__).parent / 'migrations/001_initial.sql').read_text())
+            conn.execute('CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at DOUBLE PRECISION NOT NULL)')
+            conn.execute('INSERT INTO schema_migrations VALUES(1,0)')
+            conn.execute("INSERT INTO users(id,alias,alias_key,password_hash,created_at) VALUES(7,'admin','admin','hash',1),(21,'member','member','hash',2)")
+            conn.execute('INSERT INTO supervisor_children VALUES(7,21,3)')
+            conn.execute("INSERT INTO supervisor_invites VALUES(40,7,'original-hash',4,NULL)")
+            conn.execute("INSERT INTO supervisor_invite_acceptances VALUES(40,21,'original-request-key',5)")
+
+        database = Database(URL, schema=schema)
+        with database.connect() as conn:
+            self.assertEqual(conn.execute('SELECT display_name FROM users WHERE id=7').fetchone()[0], 'admin')
+            conn.execute("UPDATE users SET display_name='Updated name' WHERE id=7")
+            self.assertEqual(conn.execute('SELECT admin_id,members_can_view_records FROM groups').fetchone()[0], 7)
+            self.assertEqual(conn.execute('SELECT members_can_view_records FROM groups').fetchone()[0], 0)
+            self.assertEqual(conn.execute('SELECT COUNT(*) FROM group_members').fetchone()[0], 2)
+            self.assertEqual(dict(conn.execute('SELECT id,group_id,token_hash,revoked_at FROM group_invites').fetchone()),
+                             {'id': 40, 'group_id': 7, 'token_hash': 'original-hash', 'revoked_at': None})
+            self.assertEqual(conn.execute('SELECT request_key FROM group_invite_acceptances').fetchone()[0], 'original-request-key')
+            conn.execute('DELETE FROM group_members WHERE user_id=21')
+        database = Database(URL, schema=schema)
+        with database.connect() as conn:
+            self.assertEqual(conn.execute('SELECT display_name FROM users WHERE id=7').fetchone()[0], 'Updated name')
+            self.assertEqual(conn.execute('SELECT COUNT(*) FROM groups').fetchone()[0], 1)
+            self.assertIsNone(conn.execute('SELECT 1 FROM group_members WHERE user_id=21').fetchone())
+            next_group = conn.insert_id("INSERT INTO groups(name,admin_id,created_at) VALUES('next',7,6)", ())
+            self.assertGreater(next_group, 7)
+            next_invite = conn.insert_id("INSERT INTO group_invites(group_id,token_hash,created_at) VALUES(?,'next-hash',6)", (next_group,))
+            self.assertGreater(next_invite, 40)
+
+    @unittest.skip('SQLite conversion fixture; group import covers PostgreSQL conversion')
+    async def test_legacy_migration_once_and_retired_routes(self):
         pass
 
-    @unittest.skip('SQLite legacy fixture; PostgreSQL data preservation covered by importer tests')
-    async def test_migration_preserves_existing_session_and_day_rows(self):
-        pass
-
-    async def blocked_acceptance(self, parent_id, child_id, child, invite, key, mutation):
+    async def test_accept_rechecks_revocation_after_group_lock(self):
         import threading
         from backend.database import Connection
+        admin, _ = await self.account('guard-admin')
+        member, _ = await self.account('guard-member')
+        invite = await self.invite(admin)
+        gid = self.group_ids[id(admin)]
         started = threading.Event()
-        original = Connection.lock_users
-        def waiting_lock(conn, ids):
+        original = Connection.lock_group
+        def waiting(conn, group_id):
             started.set()
-            return original(conn, ids)
+            return original(conn, group_id)
         with self.app.state.database.connect() as guard:
-            guard.lock_users([parent_id, child_id])
-            with patch.object(Connection, 'lock_users', waiting_lock):
-                task = asyncio.create_task(child.post('/api/v1/supervisor-invites/accept', json={
-                    'token': invite['token'], 'request_key': key}))
+            guard.lock_group(gid)
+            with patch.object(Connection, 'lock_group', waiting):
+                task = asyncio.create_task(member.post('/api/v1/group-invites/accept', json={
+                    'token': invite['token'], 'request_key': 'guard-request-key'}))
                 self.assertTrue(await asyncio.to_thread(started.wait, 3))
                 self.assertFalse(task.done())
-                mutation(guard)
-        return await asyncio.wait_for(task, 10)
+                guard.execute('UPDATE group_invites SET revoked_at=1 WHERE id=?', (invite['invite']['id'],))
+        result = await asyncio.wait_for(task, 10)
+        self.assertEqual(result.status_code, 404, result.text)
 
-    async def test_accept_rechecks_revocation_after_waiting_for_guard(self):
-        parent, parent_user = await self.account('guard-parent', supervisor=True)
-        child, child_user = await self.account('guard-child')
-        invite = await self.invite(parent)
-        response = await self.blocked_acceptance(parent_user['id'], child_user['id'], child, invite,
-            'guard-new-acceptance-key', lambda conn: conn.execute(
-                'UPDATE supervisor_invites SET revoked_at=? WHERE id=?', (1, invite['invite']['id'])))
-        self.assertEqual(response.status_code, 404, response.text)
-        self.assertEqual((await child.get('/api/v1/account/supervisors')).json()['supervisors'], [])
-
-    async def test_old_retry_cannot_restore_grant_removed_while_waiting(self):
-        parent, parent_user = await self.account('unlink-parent', supervisor=True)
-        child, child_user = await self.account('unlink-child')
-        invite = await self.invite(parent)
-        key = 'unlink-old-acceptance-key'
-        await self.accept(child, invite, key)
-        response = await self.blocked_acceptance(parent_user['id'], child_user['id'], child, invite,
-            key, lambda conn: conn.execute('DELETE FROM supervisor_children WHERE supervisor_id=? AND child_id=?',
-                                          (parent_user['id'], child_user['id'])))
-        self.assertEqual(response.status_code, 200, response.text)
-        self.assertEqual((await child.get('/api/v1/account/supervisors')).json()['supervisors'], [])
-
-    async def test_reciprocal_acceptance_does_not_deadlock(self):
-        a, a_user = await self.account('reciprocal-a', supervisor=True)
-        b, b_user = await self.account('reciprocal-b', supervisor=True)
-        a_invite, b_invite = await asyncio.gather(self.invite(a), self.invite(b))
-        await asyncio.wait_for(asyncio.gather(self.accept(a, b_invite), self.accept(b, a_invite)), 10)
-        self.assertEqual((await a.get('/api/v1/supervisor/children')).json()['children'][0]['id'], b_user['id'])
-        self.assertEqual((await b.get('/api/v1/supervisor/children')).json()['children'][0]['id'], a_user['id'])
-
-    async def test_identical_acceptance_key_is_a_single_receipt(self):
-        parent, parent_user = await self.account('receipt-parent', supervisor=True)
-        child, child_user = await self.account('receipt-child')
-        invite = await self.invite(parent)
-        await asyncio.wait_for(asyncio.gather(*[
-            self.accept(child, invite, key='same-request-key-for-retry') for _ in range(8)
-        ]), 10)
-        with self.app.state.database.connect() as conn:
-            count = conn.execute('SELECT count(*) FROM supervisor_invite_acceptances').fetchone()[0]
-        self.assertEqual(count, 1)
-        await child.delete(f"/api/v1/account/supervisors/{parent_user['id']}")
-        await self.accept(child, invite, key='same-request-key-for-retry')
-        self.assertEqual((await child.get('/api/v1/account/supervisors')).json()['supervisors'], [])
 
 
 @unittest.skipUnless(URL, 'set PRAYER_TEST_DATABASE_URL for real PostgreSQL validation')

@@ -49,7 +49,7 @@ def normalize_alias(value: str) -> str:
     if not 3 <= len(value) <= 24 or not all(
         c.isalnum() or unicodedata.category(c) == "Mn" or c in " _-" for c in value
     ) or not any(c.isalnum() for c in value):
-        raise ValueError("استخدم اسمًا مستعارًا من ٣ إلى ٢٤ حرفًا، دون بريد إلكتروني أو بيانات شخصية")
+        raise ValueError("استخدم اسم مستخدم من ٣ إلى ٢٤ حرفًا، دون بريد إلكتروني أو بيانات شخصية")
     return value
 
 
@@ -70,7 +70,29 @@ class Credentials(StrictModel):
         return value
 
 
+def normalize_display_name(value: str) -> str:
+    if any(unicodedata.category(c).startswith("C") for c in value):
+        raise ValueError("اختر اسم عرض من ١ إلى ٨٠ حرفًا دون محارف تحكم")
+    value = value.strip()
+    if not 1 <= len(value) <= 80:
+        raise ValueError("اختر اسم عرض من ١ إلى ٨٠ حرفًا دون محارف تحكم")
+    return value
+
+
 class Registration(Credentials):
+    display_name: str = ""
+
+    @field_validator("display_name")
+    @classmethod
+    def validate_display_name(cls, value: str) -> str:
+        return normalize_display_name(value)
+
+    @model_validator(mode="after")
+    def default_display_name(self):
+        if "display_name" not in self.model_fields_set:
+            self.display_name = self.alias
+        return self
+
     account_type: Literal["child", "supervisor"] = "child"
 
 
@@ -80,6 +102,33 @@ class InviteToken(StrictModel):
 
 class InviteAcceptance(InviteToken):
     request_key: Annotated[str, Field(min_length=16, max_length=128, pattern=r"^[A-Za-z0-9_-]+$")]
+
+
+class GroupCreate(StrictModel):
+    name: Annotated[str, Field(min_length=1, max_length=80)]
+    members_can_view_records: StrictBool = False
+
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, value):
+        if value is None:
+            raise ValueError("اسم المجموعة غير صالح")
+        value = unicodedata.normalize("NFKC", value).strip()
+        if not value or any(unicodedata.category(c).startswith("C") for c in value):
+            raise ValueError("اسم المجموعة غير صالح")
+        return value
+
+
+class GroupPatch(StrictModel):
+    name: Annotated[str, Field(min_length=1, max_length=80)] | None = None
+    members_can_view_records: StrictBool | None = None
+    validate_name = field_validator("name")(GroupCreate.validate_name.__func__)
+
+    @model_validator(mode="after")
+    def validate_update(self):
+        if not self.model_fields_set or any(getattr(self, key) is None for key in self.model_fields_set):
+            raise ValueError("اختر تحديثًا صالحًا")
+        return self
 
 
 class Prayers(StrictModel):
@@ -130,6 +179,15 @@ class CyclePatch(StrictModel):
 
 
 class AccountPatch(StrictModel):
+    display_name: str | None = None
+
+    @field_validator("display_name")
+    @classmethod
+    def validate_display_name(cls, value: str | None) -> str:
+        if value is None:
+            raise ValueError("اختر اسم عرض صالحًا")
+        return normalize_display_name(value)
+
     city_id: str | None = None
     can_supervise: StrictBool | None = None
 
@@ -380,11 +438,15 @@ def create_app(db_path: str | Path | None = None, *, cookie_secure: bool | None 
 
     @app.middleware("http")
     async def safe_headers_and_origin(request: Request, call_next):
+        path = request.url.path
+        retired = path.startswith(("/api/v1/supervisor/", "/api/v1/supervisor-invites/", "/api/v1/account/supervisors"))
         is_write = request.method not in ("GET", "HEAD", "OPTIONS") and request.url.path.startswith("/api/v1/")
         origin = request.headers.get("origin")
         bearer = request.headers.get("authorization", "").lower().startswith("bearer ")
         cookie_write = COOKIE_NAME in request.cookies and not bearer
-        if is_write and (origin is not None or cookie_write):
+        if retired:
+            response = JSONResponse({"detail": "الإشراف القديم متوقف. استخدم المجموعات"}, status_code=410)
+        elif is_write and (origin is not None or cookie_write):
             expected = normalized_origin(trusted_origin or str(request.base_url))
             if origin is None or normalized_origin(origin) != expected:
                 response = JSONResponse({"detail": "لأمان حسابك، أرسل التغيير من صفحة التطبيق نفسها"}, status_code=403)
@@ -408,8 +470,10 @@ def create_app(db_path: str | Path | None = None, *, cookie_secure: bool | None 
         location = error.get("loc", ())
         if "password" in location:
             detail = "اختر كلمة مرور من ٨ إلى ١٢٨ حرفًا، وليست مسافات فقط"
+        elif "display_name" in location:
+            detail = "اختر اسم عرض من ١ إلى ٨٠ حرفًا دون محارف تحكم"
         elif "alias" in location:
-            detail = "استخدم اسمًا مستعارًا من ٣ إلى ٢٤ حرفًا، دون بريد إلكتروني أو بيانات شخصية"
+            detail = "استخدم اسم مستخدم من ٣ إلى ٢٤ حرفًا، دون بريد إلكتروني أو بيانات شخصية"
         elif "prayer_key" in location:
             detail = "اختر صلاة من الفجر والظهر والعصر والمغرب والعشاء"
         elif "state" in location:
@@ -436,7 +500,7 @@ def create_app(db_path: str | Path | None = None, *, cookie_secure: bool | None 
             raise HTTPException(401, "سجّل الدخول أولًا", headers={"WWW-Authenticate": "Bearer"})
         with database.connect() as conn:
             row = conn.execute("""
-                SELECT users.id,users.alias,users.city_id,users.can_supervise FROM sessions JOIN users ON users.id=sessions.user_id
+                SELECT users.id,users.alias,users.display_name,users.city_id,users.can_supervise FROM sessions JOIN users ON users.id=sessions.user_id
                 WHERE sessions.token_hash=? AND sessions.expires_at>?
             """, (token_hash(token), time.time())).fetchone()
         if row is None:
@@ -447,7 +511,7 @@ def create_app(db_path: str | Path | None = None, *, cookie_secure: bool | None 
         city_id = user["city_id"] if "city_id" in user.keys() else user.get("city_id")
         city = CITIES_BY_ID.get(city_id)
         return {
-            "id": user["id"], "alias": user["alias"], "city_id": city_id,
+            "id": user["id"], "alias": user["alias"], "display_name": user["display_name"], "city_id": city_id,
             "can_supervise": bool(user["can_supervise"]),
             "city_name": city["name"] if city else None,
             "timezone": city["timezone"] if city else None,
@@ -541,14 +605,14 @@ def create_app(db_path: str | Path | None = None, *, cookie_secure: bool | None 
         try:
             with database.connect() as conn:
                 can_supervise = body.account_type == "supervisor"
-                user_id = conn.insert_id("INSERT INTO users(alias,alias_key,password_hash,created_at,can_supervise) VALUES(?,?,?,?,?)",
-                                      (body.alias, body.alias.casefold(), stored_hash, time.time(), int(can_supervise)))
-                return issue_session(conn, user_view({"id": user_id, "alias": body.alias, "city_id": None,
+                user_id = conn.insert_id("INSERT INTO users(alias,alias_key,password_hash,created_at,can_supervise,display_name) VALUES(?,?,?,?,?,?)",
+                                      (body.alias, body.alias.casefold(), stored_hash, time.time(), int(can_supervise), body.display_name))
+                return issue_session(conn, user_view({"id": user_id, "alias": body.alias, "display_name": body.display_name, "city_id": None,
                                                       "can_supervise": can_supervise}), response)
         except Exception as exc:
             if not is_unique_violation(exc):
                 raise
-            raise HTTPException(409, "هذا الاسم المستعار مستخدم. اختر اسمًا آخر") from None
+            raise HTTPException(409, "اسم المستخدم هذا مستخدم. اختر اسمًا آخر") from None
 
     @app.post("/api/v1/auth/login")
     def login(body: Credentials, response: Response, request: Request):
@@ -557,7 +621,7 @@ def create_app(db_path: str | Path | None = None, *, cookie_secure: bool | None 
             row = conn.execute("SELECT * FROM users WHERE alias_key=?", (body.alias.casefold(),)).fetchone()
             valid = password_matches(body.password, row["password_hash"] if row else dummy_password)
             if row is None or not valid:
-                raise HTTPException(401, "الاسم المستعار أو كلمة المرور غير صحيحة")
+                raise HTTPException(401, "اسم المستخدم أو كلمة المرور غير صحيحة")
             return issue_session(conn, user_view(row), response)
 
     @app.get("/api/v1/auth/me")
@@ -582,150 +646,236 @@ def create_app(db_path: str | Path | None = None, *, cookie_secure: bool | None 
             row = conn.execute("SELECT * FROM users WHERE id=?", (user["id"],)).fetchone()
         return {"user": user_view(row)}
 
-    def require_supervisor(user: dict):
-        if not user["can_supervise"]:
-            raise HTTPException(403, "فعّل الإشراف من حسابي أولًا")
+    def group_view(conn, group, user_id):
+        return {**dict(group), 'members_can_view_records': bool(group['members_can_view_records']),
+                'is_admin': group['admin_id'] == user_id,
+                'member_count': conn.execute('SELECT COUNT(*) FROM group_members WHERE group_id=?', (group['id'],)).fetchone()[0]}
 
-    def invite_view(row) -> dict:
-        return {key: row[key] for key in ("id", "created_at", "revoked_at")}
+    def require_group(conn, group_id, user, *, admin=False, records=False):
+        group = conn.execute('SELECT groups.* FROM groups JOIN group_members ON group_members.group_id=groups.id WHERE groups.id=? AND group_members.user_id=?', (group_id, user['id'])).fetchone()
+        if group is None or (admin and group['admin_id'] != user['id']) or (records and group['admin_id'] != user['id'] and not group['members_can_view_records']):
+            raise HTTPException(403, 'لا تملك صلاحية الوصول إلى المجموعة')
+        return group
 
-    def active_invite(conn, token: str):
-        row = conn.execute("""
-            SELECT supervisor_invites.*,users.alias FROM supervisor_invites
-            JOIN users ON users.id=supervisor_invites.supervisor_id
-            WHERE supervisor_invites.token_hash=? AND revoked_at IS NULL AND users.can_supervise=1
-        """, (token_hash(token),)).fetchone()
-        if row is None:
-            raise HTTPException(404, "رابط الإشراف غير صالح أو تم إلغاؤه أو استبداله")
-        return row
-
-    def supervisor_view(row) -> dict:
-        return {"id": row["supervisor_id"], "alias": row["alias"]}
-
-    def create_invite(user: dict, rotate: bool) -> dict:
-        require_supervisor(user)
-        token = secrets.token_urlsafe(32)
-        now = time.time()
+    @app.get('/api/v1/groups')
+    def list_groups(user: dict = Depends(current_user)):
         with database.connect() as conn:
-            conn.lock_users([user["id"]])
-            if rotate:
-                conn.execute("UPDATE supervisor_invites SET revoked_at=? WHERE supervisor_id=? AND revoked_at IS NULL",
-                             (now, user["id"]))
-            elif conn.execute("SELECT 1 FROM supervisor_invites WHERE supervisor_id=? AND revoked_at IS NULL",
-                              (user["id"],)).fetchone():
-                raise HTTPException(409, "لديك رابط نشط بالفعل. استبدله إذا فقدت نسخته")
-            invite_id = conn.insert_id("INSERT INTO supervisor_invites(supervisor_id,token_hash,created_at) VALUES(?,?,?)",
-                                  (user["id"], token_hash(token), now))
-            invite = {"id": invite_id, "created_at": now, "revoked_at": None}
-        # Never derive a share link from an untrusted Host or forwarded header.
-        link = f"{trusted_origin.rstrip('/')}/#invite={token}" if trusted_origin else None
-        return {"invite": invite, "token": token, "link": link}
+            rows = conn.execute('SELECT groups.* FROM groups JOIN group_members ON group_id=groups.id WHERE user_id=? ORDER BY groups.id', (user['id'],)).fetchall()
+            return {'groups': [group_view(conn, row, user['id']) for row in rows]}
 
-    @app.post("/api/v1/supervisor/invites", status_code=201)
-    def post_invite(request: Request, user: dict = Depends(current_user)):
-        invite_write_limiter.check(request)
-        return create_invite(user, rotate=False)
-
-    @app.post("/api/v1/supervisor/invites/rotate", status_code=201)
-    def rotate_invite(request: Request, user: dict = Depends(current_user)):
-        invite_write_limiter.check(request)
-        return create_invite(user, rotate=True)
-
-    @app.get("/api/v1/supervisor/invites")
-    def list_invites(user: dict = Depends(current_user)):
-        require_supervisor(user)
+    @app.post('/api/v1/groups', status_code=201)
+    def post_group(body: GroupCreate, user: dict = Depends(current_user)):
         with database.connect() as conn:
-            rows = conn.execute("SELECT id,created_at,revoked_at FROM supervisor_invites WHERE supervisor_id=? ORDER BY id DESC",
-                                (user["id"],)).fetchall()
-        return {"invites": [invite_view(row) for row in rows]}
-
-    @app.delete("/api/v1/supervisor/invites/{invite_id}")
-    def revoke_invite(invite_id: int, user: dict = Depends(current_user)):
-        require_supervisor(user)
-        with database.connect() as conn:
-            conn.lock_users([user["id"]])
-            cursor = conn.execute("UPDATE supervisor_invites SET revoked_at=COALESCE(revoked_at,?) WHERE id=? AND supervisor_id=?",
-                                  (time.time(), invite_id, user["id"]))
-            if not cursor.rowcount:
-                raise HTTPException(404, "رابط الإشراف غير موجود")
-        return {"ok": True}
-
-    @app.post("/api/v1/supervisor-invites/preview")
-    def preview_invite(body: InviteToken, request: Request):
-        invite_lookup_limiter.check(request)
-        with database.connect() as conn:
-            row = active_invite(conn, body.token)
-        return {"supervisor": supervisor_view(row), "scope": "prayer_history_read"}
-
-    @app.post("/api/v1/supervisor-invites/accept")
-    def accept_invite(body: InviteAcceptance, request: Request, user: dict = Depends(current_user)):
-        invite_lookup_limiter.check(request)
-        with database.connect() as conn:
-            # Invite ownership is immutable; recheck validity only after locking both users.
-            owner = conn.execute("SELECT supervisor_id FROM supervisor_invites WHERE token_hash=?",
-                                 (token_hash(body.token),)).fetchone()
-            conn.lock_users([user["id"]] + ([owner["supervisor_id"]] if owner else []))
-            previous = conn.execute("""
-                SELECT supervisor_invites.*,users.alias FROM supervisor_invite_acceptances
-                JOIN supervisor_invites ON supervisor_invites.id=supervisor_invite_acceptances.invite_id
-                JOIN users ON users.id=supervisor_invites.supervisor_id
-                WHERE child_id=? AND request_key=?
-            """, (user["id"], body.request_key)).fetchone()
-            if previous is not None:
-                if not hmac.compare_digest(previous["token_hash"], token_hash(body.token)):
-                    raise HTTPException(409, "استُخدم مفتاح هذا الطلب لرابط آخر. أكد الإضافة من جديد")
-                # A retry is a receipt, never a new grant, including after unlink/revocation.
-                return {"ok": True, "supervisor": supervisor_view(previous)}
-            row = active_invite(conn, body.token)
-            if row["supervisor_id"] == user["id"]:
-                raise HTTPException(409, "لا يمكنك إضافة نفسك مشرفًا على حسابك")
+            conn.lock_users([user['id']])
             now = time.time()
-            conn.execute("INSERT INTO supervisor_children(supervisor_id,child_id,created_at) VALUES(?,?,?) ON CONFLICT(supervisor_id,child_id) DO NOTHING",
-                         (row["supervisor_id"], user["id"], now))
-            conn.execute("INSERT INTO supervisor_invite_acceptances(invite_id,child_id,request_key,accepted_at) VALUES(?,?,?,?)",
-                         (row["id"], user["id"], body.request_key, now))
-        return {"ok": True, "supervisor": supervisor_view(row)}
+            gid = conn.insert_id('INSERT INTO groups(name,admin_id,members_can_view_records,created_at) VALUES(?,?,?,?)', (body.name, user['id'], int(body.members_can_view_records), now))
+            conn.execute('INSERT INTO group_members(group_id,user_id,created_at) VALUES(?,?,?)', (gid, user['id'], now))
+            canonical_group_invite(conn, gid)
+            return {'group': group_view(conn, require_group(conn, gid, user), user['id'])}
 
-    @app.get("/api/v1/account/supervisors")
-    def list_supervisors(user: dict = Depends(current_user)):
+    @app.get('/api/v1/groups/{group_id}')
+    def get_group(group_id: int, user: dict = Depends(current_user)):
         with database.connect() as conn:
-            rows = conn.execute("""
-                SELECT users.id,users.alias FROM supervisor_children
-                JOIN users ON users.id=supervisor_children.supervisor_id WHERE child_id=? ORDER BY users.id
-            """, (user["id"],)).fetchall()
-        return {"supervisors": [dict(row) for row in rows]}
-
-    @app.delete("/api/v1/account/supervisors/{supervisor_id}")
-    def remove_supervisor(supervisor_id: int, user: dict = Depends(current_user)):
+            group = require_group(conn, group_id, user)
+            rows = conn.execute('SELECT users.* FROM users JOIN group_members ON user_id=users.id WHERE group_id=? ORDER BY users.id', (group_id,)).fetchall()
+            result = {'group': group_view(conn, group, user['id']), 'can_view_records': group['admin_id'] == user['id'] or bool(group['members_can_view_records'])}
+        result['members'] = [{**user_view(row), 'is_admin': row['id'] == group['admin_id']} for row in rows]
         with database.connect() as conn:
-            conn.lock_users([supervisor_id, user["id"]])
-            conn.execute("DELETE FROM supervisor_children WHERE supervisor_id=? AND child_id=?", (supervisor_id, user["id"]))
-        return {"ok": True}
+            latest = require_group(conn, group_id, user)
+            authorized = {row[0] for row in conn.execute('SELECT user_id FROM group_members WHERE group_id=?', (group_id,))}
+            result['group'] = group_view(conn, latest, user['id'])
+            result['can_view_records'] = latest['admin_id'] == user['id'] or bool(latest['members_can_view_records'])
+        result['members'] = [row for row in result['members'] if row['id'] in authorized]
+        return result
 
-    @app.get("/api/v1/supervisor/children")
-    def list_children(user: dict = Depends(current_user)):
-        require_supervisor(user)
+    @app.patch('/api/v1/groups/{group_id}')
+    def patch_group(group_id: int, body: GroupPatch, user: dict = Depends(current_user)):
         with database.connect() as conn:
-            rows = conn.execute("""
-                SELECT users.* FROM supervisor_children JOIN users ON users.id=supervisor_children.child_id
-                WHERE supervisor_id=? ORDER BY users.id
-            """, (user["id"],)).fetchall()
-        return {"children": [user_view(row) for row in rows]}
+            conn.lock_group(group_id)
+            require_group(conn, group_id, user, admin=True)
+            updates = body.model_dump(exclude_unset=True)
+            if 'members_can_view_records' in updates:
+                updates['members_can_view_records'] = int(updates['members_can_view_records'])
+            conn.execute('UPDATE groups SET ' + ','.join(f'{key}=?' for key in updates) + ' WHERE id=?', (*updates.values(), group_id))
+            return {'group': group_view(conn, require_group(conn, group_id, user), user['id'])}
 
-    @app.get("/api/v1/supervisor/daily-review")
-    def daily_review(date: str, limit: int = Query(default=50, ge=1, le=100),
+    def delete_membership(group_id, member_id, user, admin):
+        with database.connect() as conn:
+            conn.lock_group(group_id)
+            group = require_group(conn, group_id, user, admin=admin)
+            if group['admin_id'] == member_id:
+                raise HTTPException(409, 'لا يمكن إزالة مدير المجموعة أو مغادرته')
+            conn.execute('DELETE FROM group_members WHERE group_id=? AND user_id=?', (group_id, member_id))
+        return {'ok': True}
+
+    @app.delete('/api/v1/groups/{group_id}')
+    def delete_group(group_id: int, user: dict = Depends(current_user)):
+        with database.connect() as conn:
+            conn.lock_group(group_id)
+            require_group(conn, group_id, user, admin=True)
+            # Receipts reference invitations without a cascading foreign key.
+            # Delete only group-owned data; personal users and days remain intact.
+            conn.execute('DELETE FROM group_invite_acceptances WHERE invite_id IN (SELECT id FROM group_invites WHERE group_id=?)', (group_id,))
+            conn.execute('DELETE FROM group_invites WHERE group_id=?', (group_id,))
+            conn.execute('DELETE FROM group_members WHERE group_id=?', (group_id,))
+            conn.execute('DELETE FROM groups WHERE id=?', (group_id,))
+        return {'ok': True}
+
+    @app.delete('/api/v1/groups/{group_id}/membership')
+    def leave_group(group_id: int, user: dict = Depends(current_user)):
+        return delete_membership(group_id, user['id'], user, False)
+
+    @app.delete('/api/v1/groups/{group_id}/members/{member_id}')
+    def remove_member(group_id: int, member_id: int, user: dict = Depends(current_user)):
+        return delete_membership(group_id, member_id, user, True)
+
+    def invite_view(row):
+        return {key: row[key] for key in ('id', 'created_at', 'revoked_at')}
+
+    def canonical_group_invite(conn, group_id):
+        row = conn.execute('SELECT * FROM group_invites WHERE group_id=? AND revoked_at IS NULL AND share_token IS NOT NULL', (group_id,)).fetchone()
+        if row is None:
+            token, now = secrets.token_urlsafe(32), time.time()
+            iid = conn.insert_id('INSERT INTO group_invites(group_id,token_hash,created_at,share_token) VALUES(?,?,?,?)', (group_id, token_hash(token), now, token))
+            row = {'id': iid, 'created_at': now, 'revoked_at': None, 'share_token': token}
+        token = row['share_token']
+        return {'invite': invite_view(row), 'token': token,
+                'link': f"{trusted_origin.rstrip('/')}/#invite={token}" if trusted_origin else None}
+
+    @app.post('/api/v1/groups/{group_id}/invite-link')
+    def get_group_invite_link(group_id: int, user: dict = Depends(current_user)):
+        with database.connect() as conn:
+            conn.lock_group(group_id)
+            require_group(conn, group_id, user, admin=True)
+            return canonical_group_invite(conn, group_id)
+
+    def create_group_invite(group_id, user, rotate):
+        token, now = secrets.token_urlsafe(32), time.time()
+        with database.connect() as conn:
+            conn.lock_group(group_id)
+            require_group(conn, group_id, user, admin=True)
+            if rotate:
+                conn.execute('UPDATE group_invites SET revoked_at=? WHERE group_id=? AND revoked_at IS NULL', (now, group_id))
+            elif conn.execute('SELECT 1 FROM group_invites WHERE group_id=? AND revoked_at IS NULL', (group_id,)).fetchone():
+                raise HTTPException(409, 'لديك رابط نشط بالفعل. استبدله إذا فقدت نسخته')
+            iid = conn.insert_id('INSERT INTO group_invites(group_id,token_hash,created_at,share_token) VALUES(?,?,?,?)', (group_id, token_hash(token), now, token))
+        return {'invite': {'id': iid, 'created_at': now, 'revoked_at': None}, 'token': token,
+                'link': f"{trusted_origin.rstrip('/')}/#invite={token}" if trusted_origin else None}
+
+    @app.post('/api/v1/groups/{group_id}/invites', status_code=201)
+    def post_group_invite(group_id: int, request: Request, user: dict = Depends(current_user)):
+        invite_write_limiter.check(request)
+        return create_group_invite(group_id, user, False)
+
+    @app.post('/api/v1/groups/{group_id}/invites/rotate', status_code=201)
+    def rotate_group_invite(group_id: int, request: Request, user: dict = Depends(current_user)):
+        invite_write_limiter.check(request)
+        return create_group_invite(group_id, user, True)
+
+    @app.get('/api/v1/groups/{group_id}/invites')
+    def list_group_invites(group_id: int, user: dict = Depends(current_user)):
+        with database.connect() as conn:
+            require_group(conn, group_id, user, admin=True)
+            return {'invites': [invite_view(row) for row in conn.execute('SELECT * FROM group_invites WHERE group_id=? ORDER BY id DESC', (group_id,))]}
+
+    @app.delete('/api/v1/groups/{group_id}/invites/{invite_id}')
+    def revoke_group_invite(group_id: int, invite_id: int, user: dict = Depends(current_user)):
+        with database.connect() as conn:
+            conn.lock_group(group_id)
+            require_group(conn, group_id, user, admin=True)
+            if not conn.execute('UPDATE group_invites SET revoked_at=COALESCE(revoked_at,?) WHERE id=? AND group_id=?', (time.time(), invite_id, group_id)).rowcount:
+                raise HTTPException(404, 'الرابط غير موجود')
+        return {'ok': True}
+
+    def invite_group_view(conn, gid):
+        row = conn.execute('SELECT groups.*,users.alias AS admin_alias,users.display_name AS admin_display_name FROM groups JOIN users ON users.id=admin_id WHERE groups.id=?', (gid,)).fetchone()
+        if row is None:
+            raise HTTPException(404, 'رابط المجموعة غير صالح أو تم إلغاؤه')
+        return {key: (bool(row[key]) if key == 'members_can_view_records' else row[key]) for key in ('id', 'name', 'admin_id', 'members_can_view_records', 'admin_alias', 'admin_display_name')}
+
+    @app.post('/api/v1/group-invites/preview')
+    def preview_group_invite(body: InviteToken, request: Request):
+        invite_lookup_limiter.check(request)
+        with database.connect() as conn:
+            row = conn.execute('SELECT group_id FROM group_invites WHERE token_hash=? AND revoked_at IS NULL', (token_hash(body.token),)).fetchone()
+            if row is None:
+                raise HTTPException(404, 'رابط المجموعة غير صالح أو تم إلغاؤه')
+            return {'group': invite_group_view(conn, row['group_id']), 'scope': 'prayer_history_read'}
+
+    @app.post('/api/v1/group-invites/accept')
+    def accept_group_invite(body: InviteAcceptance, request: Request, user: dict = Depends(current_user)):
+        invite_lookup_limiter.check(request)
+        with database.connect() as conn:
+            row = conn.execute('SELECT * FROM group_invites WHERE token_hash=?', (token_hash(body.token),)).fetchone()
+            conn.lock_group(row['group_id'] if row else 0)
+            # User lock also serializes request-key uniqueness across different groups.
+            if database.dialect == 'postgres':
+                conn.lock_users([user['id']])
+            previous = conn.execute('SELECT group_invites.* FROM group_invite_acceptances JOIN group_invites ON invite_id=group_invites.id WHERE user_id=? AND request_key=?', (user['id'], body.request_key)).fetchone()
+            if previous:
+                if not hmac.compare_digest(previous['token_hash'], token_hash(body.token)):
+                    raise HTTPException(409, 'استُخدم مفتاح الطلب لرابط آخر')
+                if not conn.execute('SELECT 1 FROM group_members WHERE group_id=? AND user_id=?', (previous['group_id'], user['id'])).fetchone():
+                    raise HTTPException(409, 'أُزيلت العضوية. أكد الانضمام من جديد بطلب جديد')
+                return {'ok': True, 'group': invite_group_view(conn, previous['group_id'])}
+            row = conn.execute('SELECT * FROM group_invites WHERE token_hash=? AND revoked_at IS NULL', (token_hash(body.token),)).fetchone()
+            if row is None:
+                raise HTTPException(404, 'رابط المجموعة غير صالح أو تم إلغاؤه')
+            now = time.time()
+            conn.execute('INSERT INTO group_members(group_id,user_id,created_at) VALUES(?,?,?) ON CONFLICT(group_id,user_id) DO NOTHING', (row['group_id'], user['id'], now))
+            conn.execute('INSERT INTO group_invite_acceptances(invite_id,user_id,request_key,accepted_at) VALUES(?,?,?,?)', (row['id'], user['id'], body.request_key, now))
+            return {'ok': True, 'group': invite_group_view(conn, row['group_id'])}
+
+    def group_member(group_id, member_id, user, *, view=True):
+        with database.connect() as conn:
+            # Resolve both memberships and visibility in the same SQL snapshot.
+            # In PostgreSQL READ COMMITTED, separate checks could observe a
+            # removed viewer with a still-current target membership.
+            row = conn.execute('''
+                SELECT users.* FROM users
+                JOIN group_members target ON target.user_id=users.id
+                JOIN groups ON groups.id=target.group_id
+                JOIN group_members viewer ON viewer.group_id=groups.id
+                WHERE groups.id=? AND target.user_id=? AND viewer.user_id=?
+                  AND (viewer.user_id=target.user_id OR groups.admin_id=viewer.user_id
+                       OR groups.members_can_view_records=1)
+            ''', (group_id, member_id, user['id'])).fetchone()
+        if row is None:
+            raise HTTPException(403, 'لا تملك صلاحية قراءة سجل هذا العضو')
+        return user_view(row) if view else None
+
+    @app.get('/api/v1/groups/{group_id}/members/{member_id}/days/{day}')
+    def member_day(group_id: int, member_id: int, day: str, user: dict = Depends(current_user)):
+        result = get_day(day, group_member(group_id, member_id, user))
+        group_member(group_id, member_id, user, view=False)
+        return result
+
+    @app.get('/api/v1/groups/{group_id}/members/{member_id}/history')
+    def member_history(group_id: int, member_id: int, start: str | None = Query(default=None, alias='from'), end: str | None = Query(default=None, alias='to'), user: dict = Depends(current_user)):
+        result = history(start, end, group_member(group_id, member_id, user))
+        group_member(group_id, member_id, user, view=False)
+        return result
+
+    @app.get('/api/v1/groups/{group_id}/members/{member_id}/statistics')
+    def member_statistics(group_id: int, member_id: int, start: str | None = Query(default=None, alias='from'), end: str | None = Query(default=None, alias='to'), user: dict = Depends(current_user)):
+        result = statistics(start, end, group_member(group_id, member_id, user))
+        group_member(group_id, member_id, user, view=False)
+        return result
+
+    @app.get("/api/v1/groups/{group_id}/daily-review")
+    def daily_review(group_id: int, date: str, limit: int = Query(default=50, ge=1, le=100),
                      offset: int = Query(default=0, ge=0), user: dict = Depends(current_user)):
-        require_supervisor(user)
         date = validated_date(date)
         instant = datetime.now(timezone.utc)
         with database.connect() as conn:
+            require_group(conn, group_id, user, records=True)
             roster = conn.execute("""
-                SELECT users.id, users.alias, users.alias_key, users.city_id,
+                SELECT users.id, users.alias, users.display_name, users.alias_key, users.city_id,
                        days.date, days.prayers, days.sunnah, days.dhuhr_before_blocks, days.version
-                FROM supervisor_children JOIN users ON users.id=supervisor_children.child_id
+                FROM group_members JOIN users ON users.id=group_members.user_id
                 LEFT JOIN days ON days.user_id=users.id AND days.date=?
-                WHERE supervisor_children.supervisor_id=?
-            """, (date, user["id"])).fetchall()
+                WHERE group_members.group_id=?
+            """, (date, group_id)).fetchall()
 
         city_schedules = {}
         rows = []
@@ -750,73 +900,34 @@ def create_app(db_path: str | Path | None = None, *, cookie_secure: bool | None 
                     city_schedules[city["id"]] = schedule
                 day = snapshot(record, city_schedules[city["id"]], scheduled=True)
             rows.append({
-                "student": {"id": child["id"], "alias": child["alias"], "city_id": child["city_id"],
+                "member": {"id": child["id"], "alias": child["alias"], "display_name": child["display_name"], "city_id": child["city_id"],
                             "timezone": city["timezone"] if city else None},
                 "has_record": child["date"] is not None, "day": day,
             })
 
         # Schedule work runs outside a transaction; verify current grants before paging.
         with database.connect() as conn:
-            supervisor = conn.execute("SELECT can_supervise FROM users WHERE id=?", (user["id"],)).fetchone()
-            if supervisor is None or not supervisor["can_supervise"]:
-                raise HTTPException(403, "فعّل الإشراف من حسابي أولًا")
-            authorized = {row["child_id"] for row in conn.execute(
-                "SELECT child_id FROM supervisor_children WHERE supervisor_id=?", (user["id"],))}
-        rows = [row for row in rows if row["student"]["id"] in authorized]
+            require_group(conn, group_id, user, records=True)
+            authorized = {row["user_id"] for row in conn.execute(
+                '''SELECT target.user_id FROM group_members target
+                   JOIN groups ON groups.id=target.group_id
+                   JOIN group_members viewer ON viewer.group_id=groups.id
+                   WHERE groups.id=? AND viewer.user_id=?
+                     AND (groups.admin_id=viewer.user_id OR groups.members_can_view_records=1)''',
+                (group_id, user['id']))}
+        rows = [row for row in rows if row["member"]["id"] in authorized]
         aliases = {child["id"]: child["alias_key"] for child in roster}
 
         def order(row):
             stats = row["day"]["stats"]
             unknown = stats["completed"] is None
             return (unknown, -(stats["completed"] or 0), -(stats["silver_medals"] or 0),
-                    aliases[row["student"]["id"]], row["student"]["id"])
+                    aliases[row["member"]["id"]], row["member"]["id"])
 
         rows.sort(key=order)
         return {"date": date, "generated_at": instant.isoformat().replace("+00:00", "Z"),
-                "limit": limit, "offset": offset, "total_students": len(rows),
+                "limit": limit, "offset": offset, "total_members": len(rows),
                 "rows": rows[offset:offset + limit]}
-
-    @app.delete("/api/v1/supervisor/children/{child_id}")
-    def remove_child(child_id: int, user: dict = Depends(current_user)):
-        require_supervisor(user)
-        with database.connect() as conn:
-            conn.lock_users([user["id"], child_id])
-            conn.execute("DELETE FROM supervisor_children WHERE supervisor_id=? AND child_id=?", (user["id"], child_id))
-        return {"ok": True}
-
-    def supervised_child(user: dict, child_id: int) -> dict:
-        require_supervisor(user)
-        with database.connect() as conn:
-            row = conn.execute("""
-                SELECT users.* FROM users JOIN supervisor_children ON child_id=users.id
-                WHERE supervisor_id=? AND child_id=?
-            """, (user["id"], child_id)).fetchone()
-        if row is None:
-            raise HTTPException(403, "لا تملك صلاحية متابعة هذا الحساب أو أُزيل الإشراف")
-        return user_view(row)
-
-    @app.get("/api/v1/supervisor/children/{child_id}/days/{day}")
-    def child_day(child_id: int, day: str, user: dict = Depends(current_user)):
-        child = supervised_child(user, child_id)
-        result = get_day(day, child)
-        supervised_child(user, child_id)
-        return result
-
-    @app.get("/api/v1/supervisor/children/{child_id}/history")
-    def child_history(child_id: int, start: str | None = Query(default=None, alias="from"),
-                      end: str | None = Query(default=None, alias="to"), user: dict = Depends(current_user)):
-        child = supervised_child(user, child_id)
-        result = history(start, end, child)
-        supervised_child(user, child_id)
-        return result
-
-    @app.get("/api/v1/supervisor/children/{child_id}/statistics")
-    def child_statistics(child_id: int, start: str | None = Query(default=None, alias="from"),
-                         end: str | None = Query(default=None, alias="to"), user: dict = Depends(current_user)):
-        child = supervised_child(user, child_id)
-        result = statistics(start, end, child)
-        supervised_child(user, child_id)
-        return result
 
     @app.post("/api/v1/auth/logout")
     def logout(request: Request, response: Response, user: dict = Depends(current_user)):

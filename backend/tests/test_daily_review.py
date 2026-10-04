@@ -42,6 +42,8 @@ class DailyReviewTests(unittest.IsolatedAsyncioTestCase):
         self.mock_clock.now.return_value = datetime(2026, 10, 3, 10, tzinfo=timezone.utc)
         self.add_user(1, 'teacher', supervisor=True)
         with self.app.state.database.connect() as conn:
+            conn.execute("INSERT INTO groups VALUES(1,'test group',1,0,0)")
+            conn.execute('INSERT INTO group_members VALUES(1,1,0)')
             conn.execute('INSERT INTO sessions VALUES(?,?,?)', (token_hash('test-token'), 1, time.time() + 3600))
         self.client.cookies.set(COOKIE_NAME, 'test-token')
 
@@ -52,10 +54,10 @@ class DailyReviewTests(unittest.IsolatedAsyncioTestCase):
 
     def add_user(self, user_id, alias, city=None, supervisor=False, linked=True):
         with self.app.state.database.connect() as conn:
-            conn.execute('INSERT INTO users(id,alias,alias_key,password_hash,created_at,city_id,can_supervise) VALUES(?,?,?,?,?,?,?)',
-                         (user_id, alias, alias.casefold(), 'unused', 0, city, int(supervisor)))
+            conn.execute('INSERT INTO users(id,alias,alias_key,password_hash,created_at,city_id,can_supervise,display_name) VALUES(?,?,?,?,?,?,?,?)',
+                         (user_id, alias, alias.casefold(), 'unused', 0, city, int(supervisor), alias))
             if linked and user_id != 1:
-                conn.execute('INSERT INTO supervisor_children VALUES(?,?,?)', (1, user_id, 0))
+                conn.execute('INSERT INTO group_members VALUES(?,?,?)', (1, user_id, 0))
 
     def save(self, user_id, prayers=None, blocks=None, witr=False, date='2026-10-02'):
         day = blank_day(date)
@@ -68,7 +70,7 @@ class DailyReviewTests(unittest.IsolatedAsyncioTestCase):
                          json.dumps(day['sunnah']), json.dumps(day['dhuhr_before_blocks']), 1, 0))
 
     async def report(self, query='date=2026-10-02'):
-        return await self.client.get('/api/v1/supervisor/daily-review?' + query)
+        return await self.client.get('/api/v1/groups/1/daily-review?' + query)
 
     async def test_completion_sort_precedes_medals_and_pagination_preserves_controls(self):
         for user_id, alias in [(2, 'Zulu'), (3, 'Alpha'), (4, 'Bravo'), (5, 'Empty'), (6, 'Zero')]:
@@ -80,13 +82,14 @@ class DailyReviewTests(unittest.IsolatedAsyncioTestCase):
         self.save(6)
         pages = [(await self.report(f'date=2026-10-02&limit=2&offset={offset}')).json() for offset in (0, 2, 4)]
         rows = [row for page in pages for row in page['rows']]
-        self.assertEqual([row['student']['id'] for row in rows], [2, 4, 3, 5, 6])
-        self.assertTrue(all(page['total_students'] == 5 for page in pages))
+        self.assertEqual([row['member']['id'] for row in rows], [2, 4, 3, 5, 1, 6])
+        self.assertTrue(all(page['total_members'] == 6 for page in pages))
         self.assertEqual(rows[0]['day']['dhuhr_before_blocks'], [False, True])
         self.assertTrue(rows[0]['day']['sunnah']['witr'])
         self.assertEqual(rows[0]['day']['stats']['silver_medals'], 2)
         self.assertFalse(rows[3]['has_record'])
-        self.assertTrue(rows[4]['has_record'])
+        self.assertFalse(rows[4]['has_record'])
+        self.assertTrue(rows[5]['has_record'])
         self.assertEqual(self.schedules.calls, [])
         self.assertEqual((await self.report()).headers['cache-control'], 'no-store')
         with self.app.state.database.connect() as conn:
@@ -98,7 +101,7 @@ class DailyReviewTests(unittest.IsolatedAsyncioTestCase):
             self.save(user_id, {'fajr': 1, 'asr': 2}, [False, True], True, date='2026-10-03')
         self.schedules.unavailable.add('makkah')
         data = (await self.report('date=2026-10-03')).json()
-        self.assertEqual([row['student']['id'] for row in data['rows']], [5, 2, 3, 4])
+        self.assertEqual([row['member']['id'] for row in data['rows']], [5, 2, 3, 1, 4])
         self.assertEqual(self.schedules.calls, [('jeddah', '2026-10-03'), ('makkah', '2026-10-03')])
         known = data['rows'][1]['day']
         self.assertEqual(known['stats']['completed'], 1)
@@ -109,7 +112,7 @@ class DailyReviewTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(data['generated_at'], '2026-10-03T10:00:00Z')
         self.schedules.calls.clear()
         future = (await self.report('date=2026-10-04')).json()
-        by_id = {row['student']['id']: row['day'] for row in future['rows']}
+        by_id = {row['member']['id']: row['day'] for row in future['rows']}
         self.assertEqual(by_id[5]['stats']['total'], 5)  # Existing no-city fallback.
         self.assertEqual(by_id[2]['stats']['total'], 0)
         self.assertEqual(self.schedules.calls, [])
@@ -119,16 +122,28 @@ class DailyReviewTests(unittest.IsolatedAsyncioTestCase):
             self.add_user(user_id, f'child-{user_id}', 'jeddah')
         def unlink():
             with self.app.state.database.connect() as conn:
-                conn.execute('DELETE FROM supervisor_children WHERE child_id=2')
+                conn.execute('DELETE FROM group_members WHERE user_id=2')
         self.schedules.callback = unlink
         data = (await self.report('date=2026-10-03&limit=1')).json()
-        self.assertEqual(data['total_students'], 1)
-        self.assertEqual(data['rows'][0]['student']['id'], 3)
+        self.assertEqual(data['total_members'], 2)
+        self.assertEqual(data['rows'][0]['member']['id'], 3)
         def revoke():
             with self.app.state.database.connect() as conn:
-                conn.execute('UPDATE users SET can_supervise=0 WHERE id=1')
+                conn.execute('DELETE FROM group_members WHERE user_id=1')
         self.schedules.callback = revoke
         self.assertEqual((await self.report('date=2026-10-03')).status_code, 403)
+
+    async def test_shared_report_visibility_revoked_during_schedule_work(self):
+        self.add_user(2, 'shared-member', 'jeddah')
+        with self.app.state.database.connect() as conn:
+            conn.execute('UPDATE groups SET members_can_view_records=1 WHERE id=1')
+            conn.execute('INSERT INTO sessions VALUES(?,?,?)',(token_hash('member-token'),2,time.time()+3600))
+        self.client.cookies.set(COOKIE_NAME,'member-token')
+        def private():
+            with self.app.state.database.connect() as conn:
+                conn.execute('UPDATE groups SET members_can_view_records=0 WHERE id=1')
+        self.schedules.callback = private
+        self.assertEqual((await self.report('date=2026-10-03')).status_code,403)
 
     async def test_one_instant_controls_different_local_dates(self):
         self.mock_clock.now.return_value = datetime(2026, 12, 2, 21, 30, tzinfo=timezone.utc)
@@ -138,7 +153,7 @@ class DailyReviewTests(unittest.IsolatedAsyncioTestCase):
         self.schedules.callback = lambda: setattr(
             self.mock_clock.now, 'return_value', datetime(2026, 12, 3, 10, tzinfo=timezone.utc))
         data = (await self.report('date=2026-12-03')).json()
-        by_id = {row['student']['id']: row['day'] for row in data['rows']}
+        by_id = {row['member']['id']: row['day'] for row in data['rows']}
         self.assertEqual(by_id[2]['schedule']['today'], '2026-12-03')
         self.assertEqual(by_id[3]['schedule']['today'], '2026-12-02')
         self.assertEqual(by_id[2]['stats']['total'], 0)
@@ -148,12 +163,12 @@ class DailyReviewTests(unittest.IsolatedAsyncioTestCase):
         self.mock_clock.now.assert_called_once_with(timezone.utc)
 
     async def test_auth_validation_and_empty_roster(self):
-        self.assertEqual((await self.report()).json()['rows'], [])
+        self.assertEqual((await self.report()).json()['total_members'], 1)
         for query in ('date=2026-02-30', 'date=2026-1-01', 'date=2026-10-02&limit=101',
                       'date=2026-10-02&limit=0', 'date=2026-10-02&offset=-1', 'limit=1'):
             self.assertEqual((await self.report(query)).status_code, 422)
         with self.app.state.database.connect() as conn:
-            conn.execute('UPDATE users SET can_supervise=0 WHERE id=1')
+            conn.execute('DELETE FROM group_members WHERE user_id=1')
         self.assertEqual((await self.report()).status_code, 403)
         self.client.cookies.clear()
         self.assertEqual((await self.report()).status_code, 401)
